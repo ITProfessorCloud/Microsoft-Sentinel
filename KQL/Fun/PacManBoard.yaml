@@ -1,0 +1,40 @@
+// This KQL generates a Pac-Man-like board with walls, dots, ghosts, and power pellets, all served in the classic ASCII style with a side of nostalgia.
+// Do not attempt if you want to keep your sanity intact.
+// ===== CONFIGURATION =====
+let boardWidth = 17;  // Must be odd number (based on desired width for characters)
+let boardHeight = 20; // Expanded to 20 rows
+let pacman = "ᗤ";     // Pac-Man symbol
+let ghost = "👻";     // Ghost symbol
+let powerPellet = "🟢"; // Power pellet symbol
+let dot = "🟡";       // Dot symbol
+let wall = "─";       // Wall symbol
+let empty = " ";      // Empty space
+// ========================
+// Generate empty board with walls and dots
+range y from 0 to boardHeight-1 step 1
+| extend row = case(
+    y == 0 or y == boardHeight-1, strcat("╭", strrep(wall, boardWidth-2), "╮"), // Top/Bottom walls
+    y % 2 == 0, strcat("│", strrep(dot, boardWidth-2), "│"), // Dot rows
+    strcat("│", strrep(empty, boardWidth-2), "│") // Empty rows
+)
+// Add characters like Pac-Man, Ghosts, and Power Pellet
+| extend row = case(
+    y == 1, strcat("│", pacman, strrep(dot, 6), "│"), // Pac-Man with dots
+    y == 2, strcat("│", strrep(dot, 4), ghost, strrep(dot, 6), "│"), // Ghost with dots
+    y == 3, strcat("│", strrep(dot, 6), ghost, strrep(dot, 5), "│"), // Ghost with dots
+    y == 4, strcat("│", strrep(dot, 3), powerPellet, strrep(dot, 9), "│"), // Power Pellet
+    y == 6, strcat("│", strrep(dot, 6), ghost, strrep(dot, 6), "│"), // Ghost with dots
+    y == 7, strcat("│", strrep(dot, 3), ghost, strrep(dot, 6), "│"), // Ghost with dots
+    y == 9, strcat("│", strrep(dot, 6), ghost, strrep(dot, 6), "│"), // Ghost with dots
+    y == 11, strcat("│", strrep(dot, 5), powerPellet, strrep(dot, 7), "│"), // Power Pellet
+    y == 13, strcat("│", strrep(dot, 6), ghost, strrep(dot, 6), "│"), // Ghost with dots
+    y == 14, strcat("│", strrep(dot, 3), ghost, strrep(dot, 6), "│"), // Ghost with dots
+    row // Default
+)
+// Add final walls with borders
+| extend row = case(
+    y == 0, strcat("╭", strrep(wall, boardWidth-2), "╮"), // Top wall
+    y == boardHeight-1, strcat("╰", strrep(wall, boardWidth-2), "╯"), // Bottom wall
+    row // Default
+)
+| project row
