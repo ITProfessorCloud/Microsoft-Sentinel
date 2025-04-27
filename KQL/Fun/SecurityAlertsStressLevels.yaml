@@ -1,0 +1,12 @@
+// Counts active alerts from the past 24 hours and categorizes stress levels based on count
+SecurityAlert
+| where TimeGenerated > ago(24h)
+| where Status == "Active"
+| summarize AlertCount=count() 
+| extend StressLevel = case(
+    AlertCount > 10, "🚨 CODE RED - Order pizza",
+    AlertCount > 5, "🔥 High - More coffee needed",
+    AlertCount > 1, "⚠️ Moderate - Business as usual",
+    "😌 Zen mode - Check your filters"
+)
+| project AlertCount, StressLevel
