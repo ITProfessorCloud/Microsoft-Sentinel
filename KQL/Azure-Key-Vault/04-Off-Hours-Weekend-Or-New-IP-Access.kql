@@ -1,0 +1,68 @@
+// Off-Hours, Weekend, or New IP Access
+// Description: Scores identity activity based on anomalous timing (off-hours/weekend) or use of a previously unseen IP address.
+
+let lookback = 14d;
+let detectWindow = 1d;
+let WorkHourStart = 8;
+let WorkHourEnd = 18;
+let AllowedAppIds = dynamic(["509e4652-da8d-478d-a730-e9d4a1996ca4","8cae6e77-e04e-42ce-b5cb-50d82bce26b1"]);
+let OperationList = dynamic(["SecretGet","KeyGet","KeyDecrypt","CertificateGet","SecretList","KeyList"]);
+let HistoricalPattern = AzureDiagnostics
+| where TimeGenerated between (ago(lookback) .. ago(detectWindow))
+| where ResourceType =~ "VAULTS" and ResultType =~ "Success"
+| where OperationName in (OperationList)
+| where not(identity_claim_appid_g in (AllowedAppIds))
+| extend CallerUPN = coalesce(
+    column_ifexists("identity_claim_upn_s",""),
+    column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s",""))
+| where isnotempty(CallerUPN)
+| summarize HistoricalIPs = make_set(CallerIPAddress, 100) by CallerUPN;
+let RecentActivity = AzureDiagnostics
+| where TimeGenerated > ago(detectWindow)
+| where ResourceType =~ "VAULTS" and ResultType =~ "Success"
+| where OperationName in (OperationList)
+| where not(identity_claim_appid_g in (AllowedAppIds))
+| extend CallerUPN = coalesce(
+    column_ifexists("identity_claim_upn_s",""),
+    column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s","")),
+    CallerObjectId = coalesce(
+        column_ifexists("identity_claim_oid_g",""),
+        column_ifexists("identity_claim_http_schemas_microsoft_com_identity_claims_objectidentifier_g","")),
+    requestUri_s = column_ifexists("requestUri_s",""),
+    clientInfo_s = column_ifexists("clientInfo_s",""),
+    CallerIPAddress = column_ifexists("CallerIPAddress",""),
+    HourOfDay = hourofday(TimeGenerated),
+    DayOfWeekInt = toint(dayofweek(TimeGenerated) / 1d)
+| where isnotempty(CallerUPN)
+| extend IsWeekend = (DayOfWeekInt == 0 or DayOfWeekInt == 6)
+| extend IsOffHours = (HourOfDay < WorkHourStart or HourOfDay >= WorkHourEnd);
+RecentActivity
+| join kind=leftouter HistoricalPattern on CallerUPN
+| extend IsNewIP = iff(isnull(HistoricalIPs), true, not(set_has_element(HistoricalIPs, CallerIPAddress)))
+| where IsOffHours == true or IsWeekend == true or IsNewIP == true
+| summarize EventCount = count(),
+            Operations = make_set(OperationName, 10),
+            Vaults = make_set(Resource, 20),
+            SecretsAccessed = make_set(requestUri_s, 30),
+            IPAddresses = make_set(CallerIPAddress, 10),
+            UserAgents = make_set(clientInfo_s, 5),
+            OffHoursEvents = countif(IsOffHours == true),
+            WeekendEvents = countif(IsWeekend == true),
+            NewIPEvents = countif(IsNewIP == true),
+            FirstSeen = min(TimeGenerated),
+            LastSeen = max(TimeGenerated)
+    by CallerUPN, CallerObjectId
+| extend RiskScore = (iff(OffHoursEvents > 0, 25, 0)) + (iff(WeekendEvents > 0, 25, 0)) + (iff(NewIPEvents > 0, 50, 0))
+| where RiskScore >= 50
+| join kind=leftouter (
+    BehaviorAnalytics
+    | where TimeGenerated > ago(7d)
+    | summarize BlastRadius = any(tostring(UsersInsights.BlastRadius)),
+                InvestigationPriority = max(InvestigationPriority),
+                AnomalousActivityCount = countif(
+                    tobool(ActivityInsights.FirstTimeUserPerformedAction) == true or
+                    tobool(ActivityInsights.FirstTimeConnectionFromCountryObservedInTenant) == true)
+        by UserName
+) on $left.CallerUPN == $right.UserName
+| project-reorder FirstSeen, LastSeen, CallerUPN, RiskScore, BlastRadius, InvestigationPriority, OffHoursEvents, WeekendEvents, NewIPEvents, AnomalousActivityCount, EventCount, Vaults, Operations, SecretsAccessed, IPAddresses, UserAgents
+| sort by RiskScore desc, InvestigationPriority desc
