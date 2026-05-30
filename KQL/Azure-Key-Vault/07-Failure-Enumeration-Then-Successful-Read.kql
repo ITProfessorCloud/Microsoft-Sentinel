@@ -1,0 +1,58 @@
+// Failure Enumeration > Successful Read Chain
+// Description: Detects reconnaissance behavior where an identity guesses secret names (generating 404/403 errors) and then successfully accesses a secret shortly after.
+
+let lookback = 1d;
+let FailureWindow = 1h;
+let MinFailures = 3;
+let Failures = AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where ResourceType =~ "VAULTS"
+| where httpStatusCode_d in (403, 404, 409, 429)
+| extend CallerUPN = coalesce(
+    column_ifexists("identity_claim_upn_s",""),
+    column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s","")),
+    CallerAppId = column_ifexists("identity_claim_appid_g",""),
+    CallerIPAddress = column_ifexists("CallerIPAddress","")
+| extend CallerKey = iff(isnotempty(CallerUPN), tolower(CallerUPN), CallerAppId)
+| extend VaultKey = toupper(Resource)
+| summarize FailureCount = count(),
+            FailureCodes = make_set(tostring(toint(httpStatusCode_d)), 10),
+            FailureOps = make_set(OperationName, 10),
+            FailureIPs = make_set(CallerIPAddress, 10),
+            FirstFailure = min(TimeGenerated),
+            LastFailure = max(TimeGenerated)
+    by CallerKey, VaultKey
+| where FailureCount >= MinFailures;
+let Successes = AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where ResourceType =~ "VAULTS"
+| where httpStatusCode_d >= 200 and httpStatusCode_d < 300
+| where OperationName in ("SecretGet","SecretList","KeyGet","KeyList","KeyDecrypt","CertificateGet","CertificateList")
+| extend CallerUPN = coalesce(
+    column_ifexists("identity_claim_upn_s",""),
+    column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s","")),
+    CallerAppId = column_ifexists("identity_claim_appid_g",""),
+    requestUri_s = column_ifexists("requestUri_s",""),
+    CallerIPAddress = column_ifexists("CallerIPAddress","")
+| extend CallerKey = iff(isnotempty(CallerUPN), tolower(CallerUPN), CallerAppId)
+| extend VaultKey = toupper(Resource)
+| summarize SuccessCount = count(),
+            SuccessOps = make_set(OperationName, 10),
+            SecretsAccessed = make_set(requestUri_s, 30),
+            SuccessIPs = make_set(CallerIPAddress, 10),
+            FirstSuccess = min(TimeGenerated),
+            LastSuccess = max(TimeGenerated)
+    by CallerKey, VaultKey;
+Failures
+| join kind=inner Successes on CallerKey, VaultKey
+| where FirstSuccess > LastFailure
+| where (FirstSuccess - LastFailure) < FailureWindow
+| extend TimeDeltaMinutes = datetime_diff('minute', FirstSuccess, LastFailure)
+| join kind=leftouter (
+    IdentityInfo
+    | where TimeGenerated > ago(14d)
+    | summarize arg_max(TimeGenerated,*) by AccountUPN
+    | project AccountUPN, AccountDisplayName, Department, JobTitle, RiskLevel
+) on $left.CallerKey == $right.AccountUPN
+| project-reorder FirstFailure, LastFailure, FirstSuccess, TimeDeltaMinutes, VaultKey, CallerKey, AccountDisplayName, Department, RiskLevel, FailureCount, SuccessCount, FailureCodes, FailureOps, FailureIPs, SuccessIPs, SecretsAccessed
+| sort by FailureCount desc
