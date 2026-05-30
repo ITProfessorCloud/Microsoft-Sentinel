@@ -1,0 +1,47 @@
+// First-Time Vault Access
+// Description: Builds a 30-day baseline of identity/vault access and fires on any new access in the last 24 hours.
+// Useful for detecting attackers pivoting to Key Vault or unauthorized permission assignments.
+
+let lookback = 30d;
+let detectWindow = 1d;
+let AllowedAppIds = dynamic(["509e4652-da8d-478d-a730-e9d4a1996ca4","8cae6e77-e04e-42ce-b5cb-50d82bce26b1"]);
+let OperationList = dynamic(["SecretGet","KeyGet","VaultGet","SecretList","KeyList","CertificateGet","CertificateList"]);
+let Baseline = AzureDiagnostics
+| where TimeGenerated between (ago(lookback) .. ago(detectWindow))
+| where ResourceType =~ "VAULTS" and ResultType =~ "Success"
+| where OperationName in (OperationList)
+| where not(identity_claim_appid_g in (AllowedAppIds))
+| extend CallerUPN = coalesce(column_ifexists("identity_claim_upn_s",""), column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s","")),
+         CallerAppId = column_ifexists("identity_claim_appid_g","")
+| extend CallerKey = iff(isnotempty(CallerUPN), CallerUPN, CallerAppId)
+| summarize BaselineVaults = make_set(Resource) by CallerKey;
+let Recent = AzureDiagnostics
+| where TimeGenerated > ago(detectWindow)
+| where ResourceType =~ "VAULTS" and ResultType =~ "Success"
+| where OperationName in (OperationList)
+| where not(identity_claim_appid_g in (AllowedAppIds))
+| extend CallerUPN = coalesce(column_ifexists("identity_claim_upn_s",""), column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s","")),
+         CallerObjectId = coalesce(column_ifexists("identity_claim_oid_g",""), column_ifexists("identity_claim_http_schemas_microsoft_com_identity_claims_objectidentifier_g","")),
+         CallerAppId = column_ifexists("identity_claim_appid_g",""),
+         requestUri_s = column_ifexists("requestUri_s",""),
+         clientInfo_s = column_ifexists("clientInfo_s",""),
+         CallerIPAddress = column_ifexists("CallerIPAddress","")
+| extend CallerKey = iff(isnotempty(CallerUPN), CallerUPN, CallerAppId)
+| summarize EventCount = count(),
+            Operations = make_set(OperationName, 20),
+            Vaults = make_set(Resource, 20),
+            IPAddresses = make_set(CallerIPAddress, 10),
+            UserAgents = make_set(clientInfo_s, 5),
+            SecretURIs = make_set(requestUri_s, 50),
+            FirstSeen = min(TimeGenerated),
+            LastSeen = max(TimeGenerated)
+    by CallerKey, CallerObjectId;
+Recent
+| join kind=leftanti Baseline on CallerKey
+| join kind=leftouter (
+    IdentityInfo
+    | where TimeGenerated > ago(14d)
+    | summarize arg_max(TimeGenerated,*) by AccountObjectId
+    | project AccountObjectId, AccountDisplayName, Department, JobTitle, RiskLevel
+) on $left.CallerObjectId == $right.AccountObjectId
+| project-reorder FirstSeen, LastSeen, CallerKey, AccountDisplayName, Department, JobTitle, RiskLevel, EventCount, Vaults, Operations, IPAddresses, SecretURIs
