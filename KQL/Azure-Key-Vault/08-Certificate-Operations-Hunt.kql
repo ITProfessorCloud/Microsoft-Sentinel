@@ -1,0 +1,43 @@
+// Certificate Operations Hunt
+// Description: Tracks the lifecycle of certificate operations, specifically highlighting sensitive operations like backup, restore, and purging, which are often used in exfiltration.
+
+let lookback = 7d;
+let CertOps = dynamic([
+    "CertificateGet","CertificateList","CertificateGetDeleted","CertificateListDeleted",
+    "CertificateRecover","CertificateDelete","CertificatePurge",
+    "CertificateCreate","CertificateImport","CertificateUpdate",
+    "CertificateBackup","CertificateRestore"
+]);
+let AllowedAppIds = dynamic(["509e4652-da8d-478d-a730-e9d4a1996ca4","8cae6e77-e04e-42ce-b5cb-50d82bce26b1"]);
+AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where ResourceType =~ "VAULTS" and ResultType =~ "Success"
+| where OperationName in (CertOps)
+| where not(identity_claim_appid_g in (AllowedAppIds))
+| extend CallerUPN = coalesce(column_ifexists("identity_claim_upn_s",""), column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s","")),
+         CallerObjectId = coalesce(column_ifexists("identity_claim_oid_g",""), column_ifexists("identity_claim_http_schemas_microsoft_com_identity_claims_objectidentifier_g","")),
+         CallerAppId = column_ifexists("identity_claim_appid_g",""),
+         requestUri_s = column_ifexists("requestUri_s",""),
+         clientInfo_s = column_ifexists("clientInfo_s",""),
+         CallerIPAddress = column_ifexists("CallerIPAddress","")
+| extend CallerKey = iff(isnotempty(CallerUPN), CallerUPN, CallerAppId)
+| extend IsSensitiveOp = OperationName in ("CertificateBackup","CertificateRestore","CertificateGetDeleted","CertificateRecover","CertificatePurge")
+| summarize EventCount = count(),
+            SensitiveOpCount = countif(IsSensitiveOp == true),
+            Operations = make_set(OperationName, 20),
+            Vaults = make_set(Resource, 20),
+            Certificates = make_set(requestUri_s, 50),
+            IPAddresses = make_set(CallerIPAddress, 10),
+            UserAgents = make_set(clientInfo_s, 5),
+            FirstSeen = min(TimeGenerated),
+            LastSeen = max(TimeGenerated)
+    by CallerKey, CallerObjectId
+| join kind=leftouter (
+    IdentityInfo
+    | where TimeGenerated > ago(14d)
+    | summarize arg_max(TimeGenerated,*) by AccountObjectId
+    | project AccountObjectId, AccountDisplayName, Department, JobTitle, RiskLevel
+) on $left.CallerObjectId == $right.AccountObjectId
+| extend CertRiskSignal = iff(SensitiveOpCount > 0, "⚠️ Sensitive Cert Op Detected", "ℹ️ Read/List Only")
+| project-reorder FirstSeen, LastSeen, CallerKey, AccountDisplayName, Department, CertRiskSignal, SensitiveOpCount, EventCount, Operations, Vaults, Certificates, IPAddresses, UserAgents
+| sort by SensitiveOpCount desc, EventCount desc
