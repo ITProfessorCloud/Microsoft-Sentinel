@@ -1,0 +1,36 @@
+// PowerShell Version Downgrade
+// Description: Targets attackers using -Version 2 to bypass AMSI, Script Block Logging, and Constrained Language Mode.
+// Calculates a RiskScore based on common attacker flags like -enc, -w hidden, and -exec bypass.
+
+let LookbackPeriod = 7d;
+DeviceProcessEvents
+| where Timestamp > ago(LookbackPeriod)
+| where FileName =~ "powershell.exe"
+| where ProcessCommandLine matches regex @"(?i)(?:-|/)(?:version|v)\s+2(?:\.0)?\b"
+| extend CmdLen = strlen(ProcessCommandLine),
+    HasEncodedArg = ProcessCommandLine has_any ("-enc", "-EncodedCommand", "-ec "),
+    HasHiddenWindow = (ProcessCommandLine contains "-w h" or ProcessCommandLine contains "-w hidden" or ProcessCommandLine contains "-windowstyle h" or ProcessCommandLine contains "-windowstyle hidden"),
+    HasNoProfile = ProcessCommandLine has_any ("-nop", "-noprofile"),
+    HasBypass = ProcessCommandLine has_any ("-exec bypass", "-ep bypass", "-executionpolicy bypass"),
+    HasIEX = ProcessCommandLine has_any ("iex ", "iex(", "invoke-expression"),
+    HasPipeToIEX = ProcessCommandLine matches regex @"(?i)\|\s*i(?:ex|nvoke-expression)\b",
+    HasDownloadCradle = ProcessCommandLine has_any ("DownloadString", "DownloadFile", "Invoke-WebRequest", "Net.WebClient", "irm "),
+    SuspiciousParent = InitiatingProcessFileName has_any (
+        "winword.exe","excel.exe","powerpnt.exe","outlook.exe","mshta.exe",
+        "wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","msiexec.exe",
+        "explorer.exe","svchost.exe","wmic.exe"
+    )
+| extend RiskScore = toint(HasEncodedArg) * 20
+    + toint(HasHiddenWindow) * 15
+    + toint(HasNoProfile) * 10
+    + toint(HasBypass) * 15
+    + toint(HasIEX) * 15
+    + toint(HasPipeToIEX) * 20
+    + toint(HasDownloadCradle) * 20
+    + toint(SuspiciousParent) * 25
+    + case(CmdLen > 500, 20, CmdLen > 200, 10, 0)
+| project Timestamp, DeviceName, AccountName, AccountDomain, ProcessCommandLine, CmdLen,
+    InitiatingProcessFileName, InitiatingProcessParentFileName, InitiatingProcessCommandLine,
+    RiskScore, HasEncodedArg, HasHiddenWindow, HasNoProfile, HasBypass, HasIEX, HasPipeToIEX,
+    HasDownloadCradle, SuspiciousParent, SHA256, ReportId
+| order by RiskScore desc, Timestamp desc
