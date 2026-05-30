@@ -1,0 +1,34 @@
+// Managed Identity from External IP
+// Description: Detects when a managed identity (which should only originate from Azure) attempts access from a non-Azure/non-private IP address.
+
+let lookback = 1d;
+let AllowedAppIds = dynamic(["509e4652-da8d-478d-a730-e9d4a1996ca4","8cae6e77-e04e-42ce-b5cb-50d82bce26b1"]);
+let OperationList = dynamic(["SecretGet","KeyGet","KeyDecrypt","SecretList","CertificateGet","KeyList"]);
+let AzureIPPrefixes = dynamic(["40.","52.","13.","20.","104.","168.63.","51.","23.","65.","70.","137.","157."]);
+AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where ResourceType =~ "VAULTS" and ResultType =~ "Success"
+| where OperationName in (OperationList)
+| where not(identity_claim_appid_g in (AllowedAppIds))
+| extend CallerUPN = coalesce(column_ifexists("identity_claim_upn_s",""), column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s","")),
+         CallerObjectId = coalesce(column_ifexists("identity_claim_oid_g",""), column_ifexists("identity_claim_http_schemas_microsoft_com_identity_claims_objectidentifier_g","")),
+         CallerAppId = column_ifexists("identity_claim_appid_g",""),
+         requestUri_s = column_ifexists("requestUri_s",""),
+         clientInfo_s = column_ifexists("clientInfo_s",""),
+         CallerIPAddress = column_ifexists("CallerIPAddress","")
+| where isempty(CallerUPN) and isnotempty(CallerAppId)
+| where isnotempty(CallerIPAddress)
+| extend StartsWithAzurePrefix = CallerIPAddress has_any (AzureIPPrefixes)
+| extend IsPrivateIP = (CallerIPAddress startswith "10." or CallerIPAddress startswith "192.168." or CallerIPAddress startswith "172.")
+| where StartsWithAzurePrefix == false and IsPrivateIP == false
+| summarize EventCount = count(),
+            Operations = make_set(OperationName, 10),
+            Vaults = make_set(Resource, 20),
+            SecretsAccessed = make_set(requestUri_s, 30),
+            ExternalIPs = make_set(CallerIPAddress, 10),
+            UserAgents = make_set(clientInfo_s, 5),
+            FirstSeen = min(TimeGenerated),
+            LastSeen = max(TimeGenerated)
+    by CallerObjectId, CallerAppId
+| project-reorder FirstSeen, LastSeen, CallerObjectId, CallerAppId, EventCount, Vaults, Operations, SecretsAccessed, ExternalIPs, UserAgents
+| sort by EventCount desc
