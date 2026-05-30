@@ -1,1 +1,1404 @@
-{}
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "<img src=\"https://storage.ghost.io/c/3c/1d/3c1dd412-3b6a-4afe-8bbc-88099d729abf/content/images/size/w960/2025/11/ProfoLookingGoodToday.png\" width=\"52\" height=\"52\" style=\"border-radius:50%;object-fit:cover;vertical-align:middle;margin-right:12px\"/><strong style=\"font-size:18px;vertical-align:middle\">🛡️ Diagnostic Settings Manager</strong><br/><br/>Built by <a href=\"https://itprofessor.cloud\" target=\"_blank\"><strong>itprofessor.cloud</strong></a> &nbsp;|&nbsp; Use this workbook to <strong>onboard Azure resources to Microsoft Sentinel</strong> by configuring diagnostic settings. Select resources from each tab and apply diagnostics using the buttons. Applying settings to already-configured resources is safe and idempotent.",
+        "style": "upsell"
+      },
+      "name": "title"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "crossComponentResources": [
+          "{Subscription}"
+        ],
+        "parameters": [
+          {
+            "id": "sub",
+            "version": "KqlParameterItem/1.0",
+            "name": "Subscription",
+            "type": 6,
+            "isRequired": true,
+            "multiSelect": true,
+            "quote": "'",
+            "delimiter": ",",
+            "typeSettings": {
+              "additionalResourceOptions": [
+                "value::all"
+              ],
+              "includeAll": true,
+              "showDefault": false
+            },
+            "timeContext": {
+              "durationMs": 86400000
+            },
+            "value": [
+              "value::all"
+            ]
+          },
+          {
+            "id": "rg",
+            "version": "KqlParameterItem/1.0",
+            "name": "ResourceGroup",
+            "label": "Resource Group",
+            "type": 5,
+            "isRequired": true,
+            "multiSelect": true,
+            "quote": "'",
+            "delimiter": ",",
+            "query": "ResourceContainers\n| where type =~ 'microsoft.resources/subscriptions/resourcegroups'\n| distinct resourceGroup",
+            "crossComponentResources": [
+              "{Subscription}"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": [
+                "value::all"
+              ],
+              "showDefault": false
+            },
+            "queryType": 1,
+            "value": [
+              "value::all"
+            ]
+          },
+          {
+            "id": "ws",
+            "version": "KqlParameterItem/1.0",
+            "name": "WorkspaceId",
+            "label": "Log Analytics Workspace",
+            "type": 5,
+            "isRequired": true,
+            "typeSettings": {
+              "resourceTypeFilter": {
+                "microsoft.operationalinsights/workspaces": true
+              },
+              "additionalResourceOptions": [],
+              "showDefault": false
+            },
+            "query": "Resources\n| where type =~ 'microsoft.operationalinsights/workspaces'\n| project id",
+            "crossComponentResources": [
+              "{Subscription}"
+            ],
+            "queryType": 1,
+            "value": ""
+          },
+          {
+            "id": "en",
+            "version": "KqlParameterItem/1.0",
+            "name": "EnableDiagnostics",
+            "label": "Enable Diagnostics",
+            "type": 2,
+            "isRequired": true,
+            "query": "{\"version\":\"1.0.0\",\"content\":\"[{\\\"value\\\":\\\"false\\\",\\\"label\\\":\\\"Disable\\\",\\\"selected\\\":true},{\\\"value\\\":\\\"true\\\",\\\"label\\\":\\\"Enable\\\"}]\",\"transformers\":null}",
+            "typeSettings": {
+              "additionalResourceOptions": [],
+              "showDefault": false
+            },
+            "queryType": 8,
+            "value": "true"
+          },
+          {
+            "id": "tab",
+            "version": "KqlParameterItem/1.0",
+            "name": "mainTab",
+            "type": 1,
+            "isHiddenWhenLocked": true,
+            "value": "networking"
+          }
+        ],
+        "style": "pills",
+        "queryType": 1,
+        "resourceType": "microsoft.resourcegraph/resources"
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 11,
+      "content": {
+        "version": "LinkItem/1.0",
+        "style": "tabs",
+        "links": [
+          {
+            "id": "tab-net",
+            "cellValue": "mainTab",
+            "linkTarget": "parameter",
+            "linkLabel": "🌐 Networking",
+            "subTarget": "networking",
+            "style": "link"
+          },
+          {
+            "id": "tab-stor",
+            "cellValue": "mainTab",
+            "linkTarget": "parameter",
+            "linkLabel": "🗄️ Storage & Data",
+            "subTarget": "storage",
+            "style": "link"
+          },
+          {
+            "id": "tab-apps",
+            "cellValue": "mainTab",
+            "linkTarget": "parameter",
+            "linkLabel": "📦 Apps & Other",
+            "subTarget": "apps",
+            "style": "link"
+          }
+        ]
+      },
+      "name": "tabs"
+    },
+    {
+      "type": 12,
+      "content": {
+        "version": "NotebookGroup/1.0",
+        "groupType": "editable",
+        "items": [
+          {
+            "type": 1,
+            "content": {
+              "json": "> **Networking Resources** - Select one or more resources below, then use the buttons to apply diagnostic settings to your Sentinel workspace. Resources are listed from ARG; apply settings regardless of current state.",
+              "style": "info"
+            },
+            "name": "net-intro"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "Resources\n| where type in~ (\n    \"microsoft.network/networksecuritygroups\",\n    \"microsoft.network/publicipaddresses\",\n    \"microsoft.network/virtualnetworks\",\n    \"microsoft.network/azurefirewalls\",\n    \"microsoft.network/loadbalancers\",\n    \"microsoft.network/applicationgateways\",\n    \"microsoft.network/virtualnetworkgateways\",\n    \"microsoft.network/bastionhosts\"\n)\n| where resourceGroup in~ ({ResourceGroup:value})\n| extend resourceId = tolower(id)\n| join kind=leftouter (\n    PolicyResources\n    | where type =~ 'microsoft.policyinsights/policystates'\n    | where properties.policyDefinitionAction =~ 'deployIfNotExists'\n    | where tolower(tostring(properties.resourceType)) in~ (\n    \"microsoft.network/networksecuritygroups\",\n    \"microsoft.network/publicipaddresses\",\n    \"microsoft.network/virtualnetworks\",\n    \"microsoft.network/azurefirewalls\",\n    \"microsoft.network/loadbalancers\",\n    \"microsoft.network/applicationgateways\",\n    \"microsoft.network/virtualnetworkgateways\",\n    \"microsoft.network/bastionhosts\"\n    )\n    | where tostring(properties.complianceState) =~ 'Compliant'\n    | project resourceId = tolower(tostring(properties.resourceId))\n) on resourceId\n| where isempty(resourceId1)\n| project subscriptionId, Resource=id, name, resourceGroup, location, type",
+              "size": 1,
+              "title": "Networking - Select Resources",
+              "noDataMessage": "✅ No networking resources found in the selected scope.",
+              "exportMultipleValues": true,
+              "exportedParameters": [
+                {
+                  "fieldName": "Resource",
+                  "parameterName": "resources",
+                  "parameterType": 5
+                }
+              ],
+              "showExportToExcel": true,
+              "queryType": 1,
+              "resourceType": "microsoft.resourcegraph/resources",
+              "crossComponentResources": [
+                "{Subscription}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "$gen_group",
+                    "formatter": 13,
+                    "formatOptions": {
+                      "linkTarget": "Resource",
+                      "showIcon": true
+                    }
+                  },
+                  {
+                    "columnMatch": "subscriptionId",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "Resource",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "location",
+                    "formatter": 17
+                  },
+                  {
+                    "columnMatch": "type",
+                    "formatter": 11,
+                    "formatOptions": {
+                      "showIcon": true
+                    }
+                  },
+                  {
+                    "columnMatch": "Details",
+                    "formatter": 7,
+                    "formatOptions": {
+                      "linkTarget": "CellDetails",
+                      "linkLabel": "View Details",
+                      "linkIsContextBlade": true
+                    }
+                  }
+                ],
+                "rowLimit": 500,
+                "filter": true,
+                "hierarchySettings": {
+                  "treeType": 1,
+                  "groupBy": [
+                    "type"
+                  ],
+                  "expandTopLevel": true,
+                  "finalBy": "Resource"
+                },
+                "labelSettings": [
+                  {
+                    "columnId": "subscriptionId",
+                    "label": "Subscription"
+                  },
+                  {
+                    "columnId": "Resource",
+                    "label": "Resource"
+                  },
+                  {
+                    "columnId": "resourceGroup",
+                    "label": "Resource Group"
+                  },
+                  {
+                    "columnId": "location",
+                    "label": "Location"
+                  },
+                  {
+                    "columnId": "type",
+                    "label": "Resource Type"
+                  }
+                ]
+              }
+            },
+            "name": "grid-net"
+          },
+          {
+            "type": 12,
+            "content": {
+              "version": "NotebookGroup/1.0",
+              "groupType": "editable",
+              "items": [
+                {
+                  "type": 1,
+                  "content": {
+                    "json": "### ➕ Add Diagnostic Settings\n\n1. Select rows (checkboxes) from the grid above.\n\n| Button | Logs | Metrics |\n|--------|------|--------|\n| 📋 Logs Only | `allLogs` | ❌ |\n| 📊 Metrics Only | ❌ | `AllMetrics` |\n| 📋📊 All | `allLogs` | `AllMetrics` |\n\n> Setting name: `Sentinel-Diagnostics`",
+                    "style": "info"
+                  },
+                  "name": "intro-net"
+                },
+                {
+                  "type": 11,
+                  "content": {
+                    "version": "LinkItem/1.0",
+                    "style": "list",
+                    "links": [
+                      {
+                        "id": "logs-net",
+                        "cellValue": "resources",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📋 Logs Only (allLogs category group)",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{resources}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "resources",
+                          "title": "Add Logs Only",
+                          "description": "Creates Sentinel-Diagnostics with allLogs.",
+                          "actionName": "Add Logs Only",
+                          "runLabel": "Add Logs Only",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"logs\": [{\"categoryGroup\": \"allLogs\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "metrics-net",
+                        "cellValue": "resources",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📊 Metrics Only  (AllMetrics - no logs)",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{resources}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "resources",
+                          "title": "Add Metrics Only",
+                          "description": "Creates Sentinel-Diagnostics with AllMetrics.",
+                          "actionName": "Add Metrics Only",
+                          "runLabel": "Add Metrics Only",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"metrics\": [{\"category\": \"AllMetrics\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "all-net",
+                        "cellValue": "resources",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📋📊 All (allLogs category group + AllMetrics)",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{resources}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "resources",
+                          "title": "Add Logs + Metrics",
+                          "description": "Creates Sentinel-Diagnostics with allLogs and AllMetrics.",
+                          "actionName": "Add Logs + Metrics",
+                          "runLabel": "Add Logs + Metrics",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"logs\": [{\"categoryGroup\": \"allLogs\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}], \"metrics\": [{\"category\": \"AllMetrics\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "delete-net",
+                        "cellValue": "resources",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "🗑️ Remove Sentinel-Diagnostics",
+                        "style": "secondary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{resources}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "DELETE",
+                          "applyToMultipleResourcesParameter": "resources",
+                          "title": "Remove Diagnostic Setting",
+                          "description": "Deletes the Sentinel-Diagnostics diagnostic setting from the selected resources. Only removes the setting named 'Sentinel-Diagnostics'.",
+                          "actionName": "Remove Sentinel-Diagnostics",
+                          "runLabel": "Remove Sentinel-Diagnostics",
+                          "body": ""
+                        }
+                      }
+                    ]
+                  },
+                  "name": "links-net"
+                }
+              ]
+            },
+            "conditionalVisibility": {
+              "parameterName": "EnableDiagnostics",
+              "comparison": "isEqualTo",
+              "value": "true"
+            },
+            "name": "group-arm-net"
+          }
+        ]
+      },
+      "conditionalVisibility": {
+        "parameterName": "mainTab",
+        "comparison": "isEqualTo",
+        "value": "networking"
+      },
+      "name": "group-networking"
+    },
+    {
+      "type": 12,
+      "content": {
+        "version": "NotebookGroup/1.0",
+        "groupType": "editable",
+        "items": [
+          {
+            "type": 1,
+            "content": {
+              "json": "> **Storage Resources** - Select storage accounts from each grid below, then click the button to configure diagnostics for that sub-service (Blob, File, Queue, Table). Each sub-service must be configured separately.",
+              "style": "warning"
+            },
+            "name": "stor-intro"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "Resources\n| where type in~ (\n    \"microsoft.storage/storageaccounts\"\n)\n| where resourceGroup in~ ({ResourceGroup:value})\n| extend resourceId = tolower(id)\n| join kind=leftouter (\n    PolicyResources\n    | where type =~ 'microsoft.policyinsights/policystates'\n    | where properties.policyDefinitionAction =~ 'deployIfNotExists'\n    | where tolower(tostring(properties.resourceType)) in~ (\n    \"microsoft.storage/storageaccounts\"\n    )\n    | where tostring(properties.complianceState) =~ 'Compliant'\n    | project resourceId = tolower(tostring(properties.resourceId))\n) on resourceId\n| where isempty(resourceId1)\n| project subscriptionId, Resource=id, name, resourceGroup, location, type",
+              "size": 1,
+              "title": "Blob - Select Storage Accounts",
+              "noDataMessage": "✅ No storage accounts found in the selected scope.",
+              "exportMultipleValues": true,
+              "exportedParameters": [
+                {
+                  "fieldName": "Resource",
+                  "parameterName": "res_blob",
+                  "parameterType": 5
+                }
+              ],
+              "showExportToExcel": true,
+              "queryType": 1,
+              "resourceType": "microsoft.resourcegraph/resources",
+              "crossComponentResources": [
+                "{Subscription}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Resource",
+                    "formatter": 13,
+                    "formatOptions": {
+                      "linkTarget": "Resource",
+                      "showIcon": true
+                    }
+                  },
+                  {
+                    "columnMatch": "storageAccountName",
+                    "formatter": 0
+                  },
+                  {
+                    "columnMatch": "resourceGroup",
+                    "formatter": 0
+                  },
+                  {
+                    "columnMatch": "location",
+                    "formatter": 17
+                  },
+                  {
+                    "columnMatch": "subscriptionId",
+                    "formatter": 5
+                  }
+                ],
+                "rowLimit": 500,
+                "filter": true,
+                "labelSettings": [
+                  {
+                    "columnId": "Resource",
+                    "label": "Storage Account"
+                  },
+                  {
+                    "columnId": "storageAccountName",
+                    "label": "Name"
+                  },
+                  {
+                    "columnId": "resourceGroup",
+                    "label": "Resource Group"
+                  },
+                  {
+                    "columnId": "location",
+                    "label": "Location"
+                  },
+                  {
+                    "columnId": "subscriptionId",
+                    "label": "Subscription"
+                  }
+                ]
+              }
+            },
+            "name": "grid-blob"
+          },
+          {
+            "type": 12,
+            "content": {
+              "version": "NotebookGroup/1.0",
+              "groupType": "editable",
+              "items": [
+                {
+                  "type": 11,
+                  "content": {
+                    "version": "LinkItem/1.0",
+                    "style": "list",
+                    "links": [
+                      {
+                        "id": "btn-blob",
+                        "cellValue": "res_blob",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📋📊 🔵 Enable Blob Diagnostics",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_blob}/blobServices/default/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "res_blob",
+                          "title": "Enable Blob Diagnostics",
+                          "description": "Applies Sentinel-Diagnostics to blobServices/default",
+                          "actionName": "Enable Blob Diagnostics",
+                          "runLabel": "Enable Blob Diagnostics",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"logs\": [{\"category\": \"StorageRead\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}, {\"category\": \"StorageWrite\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}, {\"category\": \"StorageDelete\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}], \"metrics\": [{\"category\": \"Transaction\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "delete-blob",
+                        "cellValue": "res_blob",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "🗑️ Remove Sentinel-Diagnostics",
+                        "style": "secondary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_blob}/blobServices/default/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "DELETE",
+                          "applyToMultipleResourcesParameter": "res_blob",
+                          "title": "Remove Diagnostic Setting",
+                          "description": "Deletes the Sentinel-Diagnostics diagnostic setting from the selected resources. Only removes the setting named 'Sentinel-Diagnostics'.",
+                          "actionName": "Remove Sentinel-Diagnostics",
+                          "runLabel": "Remove Sentinel-Diagnostics",
+                          "body": ""
+                        }
+                      }
+                    ]
+                  },
+                  "name": "btn-blob"
+                }
+              ]
+            },
+            "conditionalVisibility": {
+              "parameterName": "EnableDiagnostics",
+              "comparison": "isEqualTo",
+              "value": "true"
+            },
+            "name": "arm-blob"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "Resources\n| where type in~ (\n    \"microsoft.storage/storageaccounts\"\n)\n| where resourceGroup in~ ({ResourceGroup:value})\n| extend resourceId = tolower(id)\n| join kind=leftouter (\n    PolicyResources\n    | where type =~ 'microsoft.policyinsights/policystates'\n    | where properties.policyDefinitionAction =~ 'deployIfNotExists'\n    | where tolower(tostring(properties.resourceType)) in~ (\n    \"microsoft.storage/storageaccounts\"\n    )\n    | where tostring(properties.complianceState) =~ 'Compliant'\n    | project resourceId = tolower(tostring(properties.resourceId))\n) on resourceId\n| where isempty(resourceId1)\n| project subscriptionId, Resource=id, name, resourceGroup, location, type",
+              "size": 1,
+              "title": "File - Select Storage Accounts",
+              "noDataMessage": "✅ No storage accounts found in the selected scope.",
+              "exportMultipleValues": true,
+              "exportedParameters": [
+                {
+                  "fieldName": "Resource",
+                  "parameterName": "res_file",
+                  "parameterType": 5
+                }
+              ],
+              "showExportToExcel": true,
+              "queryType": 1,
+              "resourceType": "microsoft.resourcegraph/resources",
+              "crossComponentResources": [
+                "{Subscription}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Resource",
+                    "formatter": 13,
+                    "formatOptions": {
+                      "linkTarget": "Resource",
+                      "showIcon": true
+                    }
+                  },
+                  {
+                    "columnMatch": "storageAccountName",
+                    "formatter": 0
+                  },
+                  {
+                    "columnMatch": "resourceGroup",
+                    "formatter": 0
+                  },
+                  {
+                    "columnMatch": "location",
+                    "formatter": 17
+                  },
+                  {
+                    "columnMatch": "subscriptionId",
+                    "formatter": 5
+                  }
+                ],
+                "rowLimit": 500,
+                "filter": true,
+                "labelSettings": [
+                  {
+                    "columnId": "Resource",
+                    "label": "Storage Account"
+                  },
+                  {
+                    "columnId": "storageAccountName",
+                    "label": "Name"
+                  },
+                  {
+                    "columnId": "resourceGroup",
+                    "label": "Resource Group"
+                  },
+                  {
+                    "columnId": "location",
+                    "label": "Location"
+                  },
+                  {
+                    "columnId": "subscriptionId",
+                    "label": "Subscription"
+                  }
+                ]
+              }
+            },
+            "name": "grid-file"
+          },
+          {
+            "type": 12,
+            "content": {
+              "version": "NotebookGroup/1.0",
+              "groupType": "editable",
+              "items": [
+                {
+                  "type": 11,
+                  "content": {
+                    "version": "LinkItem/1.0",
+                    "style": "list",
+                    "links": [
+                      {
+                        "id": "btn-file",
+                        "cellValue": "res_file",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📋📊 📁 Enable File Diagnostics",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_file}/fileServices/default/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "res_file",
+                          "title": "Enable File Diagnostics",
+                          "description": "Applies Sentinel-Diagnostics to fileServices/default",
+                          "actionName": "Enable File Diagnostics",
+                          "runLabel": "Enable File Diagnostics",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"logs\": [{\"category\": \"StorageRead\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}, {\"category\": \"StorageWrite\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}, {\"category\": \"StorageDelete\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}], \"metrics\": [{\"category\": \"Transaction\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "delete-file",
+                        "cellValue": "res_file",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "🗑️ Remove Sentinel-Diagnostics",
+                        "style": "secondary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_file}/fileServices/default/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "DELETE",
+                          "applyToMultipleResourcesParameter": "res_file",
+                          "title": "Remove Diagnostic Setting",
+                          "description": "Deletes the Sentinel-Diagnostics diagnostic setting from the selected resources. Only removes the setting named 'Sentinel-Diagnostics'.",
+                          "actionName": "Remove Sentinel-Diagnostics",
+                          "runLabel": "Remove Sentinel-Diagnostics",
+                          "body": ""
+                        }
+                      }
+                    ]
+                  },
+                  "name": "btn-file"
+                }
+              ]
+            },
+            "conditionalVisibility": {
+              "parameterName": "EnableDiagnostics",
+              "comparison": "isEqualTo",
+              "value": "true"
+            },
+            "name": "arm-file"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "Resources\n| where type in~ (\n    \"microsoft.storage/storageaccounts\"\n)\n| where resourceGroup in~ ({ResourceGroup:value})\n| extend resourceId = tolower(id)\n| join kind=leftouter (\n    PolicyResources\n    | where type =~ 'microsoft.policyinsights/policystates'\n    | where properties.policyDefinitionAction =~ 'deployIfNotExists'\n    | where tolower(tostring(properties.resourceType)) in~ (\n    \"microsoft.storage/storageaccounts\"\n    )\n    | where tostring(properties.complianceState) =~ 'Compliant'\n    | project resourceId = tolower(tostring(properties.resourceId))\n) on resourceId\n| where isempty(resourceId1)\n| project subscriptionId, Resource=id, name, resourceGroup, location, type",
+              "size": 1,
+              "title": "Queue - Select Storage Accounts",
+              "noDataMessage": "✅ No storage accounts found in the selected scope.",
+              "exportMultipleValues": true,
+              "exportedParameters": [
+                {
+                  "fieldName": "Resource",
+                  "parameterName": "res_queue",
+                  "parameterType": 5
+                }
+              ],
+              "showExportToExcel": true,
+              "queryType": 1,
+              "resourceType": "microsoft.resourcegraph/resources",
+              "crossComponentResources": [
+                "{Subscription}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Resource",
+                    "formatter": 13,
+                    "formatOptions": {
+                      "linkTarget": "Resource",
+                      "showIcon": true
+                    }
+                  },
+                  {
+                    "columnMatch": "storageAccountName",
+                    "formatter": 0
+                  },
+                  {
+                    "columnMatch": "resourceGroup",
+                    "formatter": 0
+                  },
+                  {
+                    "columnMatch": "location",
+                    "formatter": 17
+                  },
+                  {
+                    "columnMatch": "subscriptionId",
+                    "formatter": 5
+                  }
+                ],
+                "rowLimit": 500,
+                "filter": true,
+                "labelSettings": [
+                  {
+                    "columnId": "Resource",
+                    "label": "Storage Account"
+                  },
+                  {
+                    "columnId": "storageAccountName",
+                    "label": "Name"
+                  },
+                  {
+                    "columnId": "resourceGroup",
+                    "label": "Resource Group"
+                  },
+                  {
+                    "columnId": "location",
+                    "label": "Location"
+                  },
+                  {
+                    "columnId": "subscriptionId",
+                    "label": "Subscription"
+                  }
+                ]
+              }
+            },
+            "name": "grid-queue"
+          },
+          {
+            "type": 12,
+            "content": {
+              "version": "NotebookGroup/1.0",
+              "groupType": "editable",
+              "items": [
+                {
+                  "type": 11,
+                  "content": {
+                    "version": "LinkItem/1.0",
+                    "style": "list",
+                    "links": [
+                      {
+                        "id": "btn-queue",
+                        "cellValue": "res_queue",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📋📊 📬 Enable Queue Diagnostics",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_queue}/queueServices/default/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "res_queue",
+                          "title": "Enable Queue Diagnostics",
+                          "description": "Applies Sentinel-Diagnostics to queueServices/default",
+                          "actionName": "Enable Queue Diagnostics",
+                          "runLabel": "Enable Queue Diagnostics",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"logs\": [{\"category\": \"StorageRead\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}, {\"category\": \"StorageWrite\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}, {\"category\": \"StorageDelete\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}], \"metrics\": [{\"category\": \"Transaction\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "delete-queue",
+                        "cellValue": "res_queue",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "🗑️ Remove Sentinel-Diagnostics",
+                        "style": "secondary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_queue}/queueServices/default/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "DELETE",
+                          "applyToMultipleResourcesParameter": "res_queue",
+                          "title": "Remove Diagnostic Setting",
+                          "description": "Deletes the Sentinel-Diagnostics diagnostic setting from the selected resources. Only removes the setting named 'Sentinel-Diagnostics'.",
+                          "actionName": "Remove Sentinel-Diagnostics",
+                          "runLabel": "Remove Sentinel-Diagnostics",
+                          "body": ""
+                        }
+                      }
+                    ]
+                  },
+                  "name": "btn-queue"
+                }
+              ]
+            },
+            "conditionalVisibility": {
+              "parameterName": "EnableDiagnostics",
+              "comparison": "isEqualTo",
+              "value": "true"
+            },
+            "name": "arm-queue"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "Resources\n| where type in~ (\n    \"microsoft.storage/storageaccounts\"\n)\n| where resourceGroup in~ ({ResourceGroup:value})\n| extend resourceId = tolower(id)\n| join kind=leftouter (\n    PolicyResources\n    | where type =~ 'microsoft.policyinsights/policystates'\n    | where properties.policyDefinitionAction =~ 'deployIfNotExists'\n    | where tolower(tostring(properties.resourceType)) in~ (\n    \"microsoft.storage/storageaccounts\"\n    )\n    | where tostring(properties.complianceState) =~ 'Compliant'\n    | project resourceId = tolower(tostring(properties.resourceId))\n) on resourceId\n| where isempty(resourceId1)\n| project subscriptionId, Resource=id, name, resourceGroup, location, type",
+              "size": 1,
+              "title": "Table - Select Storage Accounts",
+              "noDataMessage": "✅ No storage accounts found in the selected scope.",
+              "exportMultipleValues": true,
+              "exportedParameters": [
+                {
+                  "fieldName": "Resource",
+                  "parameterName": "res_table",
+                  "parameterType": 5
+                }
+              ],
+              "showExportToExcel": true,
+              "queryType": 1,
+              "resourceType": "microsoft.resourcegraph/resources",
+              "crossComponentResources": [
+                "{Subscription}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Resource",
+                    "formatter": 13,
+                    "formatOptions": {
+                      "linkTarget": "Resource",
+                      "showIcon": true
+                    }
+                  },
+                  {
+                    "columnMatch": "storageAccountName",
+                    "formatter": 0
+                  },
+                  {
+                    "columnMatch": "resourceGroup",
+                    "formatter": 0
+                  },
+                  {
+                    "columnMatch": "location",
+                    "formatter": 17
+                  },
+                  {
+                    "columnMatch": "subscriptionId",
+                    "formatter": 5
+                  }
+                ],
+                "rowLimit": 500,
+                "filter": true,
+                "labelSettings": [
+                  {
+                    "columnId": "Resource",
+                    "label": "Storage Account"
+                  },
+                  {
+                    "columnId": "storageAccountName",
+                    "label": "Name"
+                  },
+                  {
+                    "columnId": "resourceGroup",
+                    "label": "Resource Group"
+                  },
+                  {
+                    "columnId": "location",
+                    "label": "Location"
+                  },
+                  {
+                    "columnId": "subscriptionId",
+                    "label": "Subscription"
+                  }
+                ]
+              }
+            },
+            "name": "grid-table"
+          },
+          {
+            "type": 12,
+            "content": {
+              "version": "NotebookGroup/1.0",
+              "groupType": "editable",
+              "items": [
+                {
+                  "type": 11,
+                  "content": {
+                    "version": "LinkItem/1.0",
+                    "style": "list",
+                    "links": [
+                      {
+                        "id": "btn-table",
+                        "cellValue": "res_table",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📋📊 📊 Enable Table Diagnostics",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_table}/tableServices/default/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "res_table",
+                          "title": "Enable Table Diagnostics",
+                          "description": "Applies Sentinel-Diagnostics to tableServices/default",
+                          "actionName": "Enable Table Diagnostics",
+                          "runLabel": "Enable Table Diagnostics",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"logs\": [{\"category\": \"StorageRead\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}, {\"category\": \"StorageWrite\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}, {\"category\": \"StorageDelete\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}], \"metrics\": [{\"category\": \"Transaction\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "delete-table",
+                        "cellValue": "res_table",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "🗑️ Remove Sentinel-Diagnostics",
+                        "style": "secondary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_table}/tableServices/default/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "DELETE",
+                          "applyToMultipleResourcesParameter": "res_table",
+                          "title": "Remove Diagnostic Setting",
+                          "description": "Deletes the Sentinel-Diagnostics diagnostic setting from the selected resources. Only removes the setting named 'Sentinel-Diagnostics'.",
+                          "actionName": "Remove Sentinel-Diagnostics",
+                          "runLabel": "Remove Sentinel-Diagnostics",
+                          "body": ""
+                        }
+                      }
+                    ]
+                  },
+                  "name": "btn-table"
+                }
+              ]
+            },
+            "conditionalVisibility": {
+              "parameterName": "EnableDiagnostics",
+              "comparison": "isEqualTo",
+              "value": "true"
+            },
+            "name": "arm-table"
+          },
+          {
+            "type": 1,
+            "content": {
+              "json": "> **Parent AllMetrics** - Uses the Blob grid selection. Applies AllMetrics to the parent storage account.",
+              "style": "info"
+            },
+            "name": "parent-info"
+          },
+          {
+            "type": 12,
+            "content": {
+              "version": "NotebookGroup/1.0",
+              "groupType": "editable",
+              "items": [
+                {
+                  "type": 11,
+                  "content": {
+                    "version": "LinkItem/1.0",
+                    "style": "list",
+                    "links": [
+                      {
+                        "id": "btn-parent",
+                        "cellValue": "res_blob",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📋📊 📈 Enable Parent AllMetrics Diagnostics",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_blob}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "res_blob",
+                          "title": "Enable Parent AllMetrics Diagnostics",
+                          "description": "Applies Sentinel-Diagnostics to parent",
+                          "actionName": "Enable Parent AllMetrics Diagnostics",
+                          "runLabel": "Enable Parent AllMetrics Diagnostics",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"metrics\": [{\"category\": \"AllMetrics\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "delete-parent",
+                        "cellValue": "res_blob",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "🗑️ Remove Sentinel-Diagnostics",
+                        "style": "secondary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{res_blob}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "DELETE",
+                          "applyToMultipleResourcesParameter": "res_blob",
+                          "title": "Remove Diagnostic Setting",
+                          "description": "Deletes the Sentinel-Diagnostics diagnostic setting from the selected resources. Only removes the setting named 'Sentinel-Diagnostics'.",
+                          "actionName": "Remove Sentinel-Diagnostics",
+                          "runLabel": "Remove Sentinel-Diagnostics",
+                          "body": ""
+                        }
+                      }
+                    ]
+                  },
+                  "name": "btn-parent"
+                }
+              ]
+            },
+            "conditionalVisibility": {
+              "parameterName": "EnableDiagnostics",
+              "comparison": "isEqualTo",
+              "value": "true"
+            },
+            "name": "arm-parent"
+          }
+        ]
+      },
+      "conditionalVisibility": {
+        "parameterName": "mainTab",
+        "comparison": "isEqualTo",
+        "value": "storage"
+      },
+      "name": "group-storage"
+    },
+    {
+      "type": 12,
+      "content": {
+        "version": "NotebookGroup/1.0",
+        "groupType": "editable",
+        "items": [
+          {
+            "type": 1,
+            "content": {
+              "json": "> **Apps & Other Resources** - Select resources below and apply diagnostic settings. Covers Logic Apps, Web Apps, Automation Accounts, API Management, and Key Vaults.",
+              "style": "info"
+            },
+            "name": "apps-intro"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "Resources\n| where type in~ (\n    \"microsoft.web/sites\",\n    \"microsoft.logic/workflows\",\n    \"microsoft.automation/automationaccounts\",\n    \"microsoft.apimanagement/service\",\n    \"microsoft.keyvault/vaults\"\n)\n| where resourceGroup in~ ({ResourceGroup:value})\n| extend resourceId = tolower(id)\n| join kind=leftouter (\n    PolicyResources\n    | where type =~ 'microsoft.policyinsights/policystates'\n    | where properties.policyDefinitionAction =~ 'deployIfNotExists'\n    | where tolower(tostring(properties.resourceType)) in~ (\n    \"microsoft.web/sites\",\n    \"microsoft.logic/workflows\",\n    \"microsoft.automation/automationaccounts\",\n    \"microsoft.apimanagement/service\",\n    \"microsoft.keyvault/vaults\"\n    )\n    | where tostring(properties.complianceState) =~ 'Compliant'\n    | project resourceId = tolower(tostring(properties.resourceId))\n) on resourceId\n| where isempty(resourceId1)\n| project subscriptionId, Resource=id, name, resourceGroup, location, type",
+              "size": 1,
+              "title": "Apps & Other - Select Resources",
+              "noDataMessage": "✅ No app resources found in the selected scope.",
+              "exportMultipleValues": true,
+              "exportedParameters": [
+                {
+                  "fieldName": "Resource",
+                  "parameterName": "resources",
+                  "parameterType": 5
+                }
+              ],
+              "showExportToExcel": true,
+              "queryType": 1,
+              "resourceType": "microsoft.resourcegraph/resources",
+              "crossComponentResources": [
+                "{Subscription}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "$gen_group",
+                    "formatter": 13,
+                    "formatOptions": {
+                      "linkTarget": "Resource",
+                      "showIcon": true
+                    }
+                  },
+                  {
+                    "columnMatch": "subscriptionId",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "Resource",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "location",
+                    "formatter": 17
+                  },
+                  {
+                    "columnMatch": "type",
+                    "formatter": 11,
+                    "formatOptions": {
+                      "showIcon": true
+                    }
+                  },
+                  {
+                    "columnMatch": "Details",
+                    "formatter": 7,
+                    "formatOptions": {
+                      "linkTarget": "CellDetails",
+                      "linkLabel": "View Details",
+                      "linkIsContextBlade": true
+                    }
+                  }
+                ],
+                "rowLimit": 500,
+                "filter": true,
+                "hierarchySettings": {
+                  "treeType": 1,
+                  "groupBy": [
+                    "type"
+                  ],
+                  "expandTopLevel": true,
+                  "finalBy": "Resource"
+                },
+                "labelSettings": [
+                  {
+                    "columnId": "subscriptionId",
+                    "label": "Subscription"
+                  },
+                  {
+                    "columnId": "Resource",
+                    "label": "Resource"
+                  },
+                  {
+                    "columnId": "resourceGroup",
+                    "label": "Resource Group"
+                  },
+                  {
+                    "columnId": "location",
+                    "label": "Location"
+                  },
+                  {
+                    "columnId": "type",
+                    "label": "Resource Type"
+                  },
+                  {
+                    "columnId": "Details",
+                    "label": "Details"
+                  }
+                ]
+              }
+            },
+            "name": "grid-apps"
+          },
+          {
+            "type": 12,
+            "content": {
+              "version": "NotebookGroup/1.0",
+              "groupType": "editable",
+              "items": [
+                {
+                  "type": 1,
+                  "content": {
+                    "json": "### ➕ Add Diagnostic Settings\n\n1. Select rows (checkboxes) from the grid above.\n\n| Button | Logs | Metrics |\n|--------|------|--------|\n| 📋 Logs Only | `allLogs` | ❌ |\n| 📊 Metrics Only | ❌ | `AllMetrics` |\n| 📋📊 All | `allLogs` | `AllMetrics` |\n\n> Setting name: `Sentinel-Diagnostics`",
+                    "style": "info"
+                  },
+                  "name": "intro-apps"
+                },
+                {
+                  "type": 11,
+                  "content": {
+                    "version": "LinkItem/1.0",
+                    "style": "list",
+                    "links": [
+                      {
+                        "id": "logs-apps",
+                        "cellValue": "resources",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📋 Logs Only (allLogs category group)",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{resources}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "resources",
+                          "title": "Add Logs Only",
+                          "description": "Creates Sentinel-Diagnostics with allLogs.",
+                          "actionName": "Add Logs Only",
+                          "runLabel": "Add Logs Only",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"logs\": [{\"categoryGroup\": \"allLogs\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "metrics-apps",
+                        "cellValue": "resources",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📊 Metrics Only  (AllMetrics - no logs)",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{resources}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "resources",
+                          "title": "Add Metrics Only",
+                          "description": "Creates Sentinel-Diagnostics with AllMetrics.",
+                          "actionName": "Add Metrics Only",
+                          "runLabel": "Add Metrics Only",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"metrics\": [{\"category\": \"AllMetrics\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "all-apps",
+                        "cellValue": "resources",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "📋📊 All (allLogs category group + AllMetrics)",
+                        "style": "primary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{resources}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "PUT",
+                          "applyToMultipleResourcesParameter": "resources",
+                          "title": "Add Logs + Metrics",
+                          "description": "Creates Sentinel-Diagnostics with allLogs and AllMetrics.",
+                          "actionName": "Add Logs + Metrics",
+                          "runLabel": "Add Logs + Metrics",
+                          "body": "{\"properties\": {\"workspaceId\": \"{WorkspaceId}\", \"logs\": [{\"categoryGroup\": \"allLogs\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}], \"metrics\": [{\"category\": \"AllMetrics\", \"enabled\": true, \"retentionPolicy\": {\"days\": 0, \"enabled\": false}}]}}"
+                        }
+                      },
+                      {
+                        "id": "delete-apps",
+                        "cellValue": "resources",
+                        "linkTarget": "ArmAction",
+                        "linkLabel": "🗑️ Remove Sentinel-Diagnostics",
+                        "style": "secondary",
+                        "linkIsContextBlade": true,
+                        "armActionContext": {
+                          "path": "{resources}/providers/microsoft.insights/diagnosticSettings/Sentinel-Diagnostics",
+                          "headers": [],
+                          "params": [
+                            {
+                              "key": "api-version",
+                              "value": "2021-05-01-preview"
+                            }
+                          ],
+                          "isLongOperation": false,
+                          "httpMethod": "DELETE",
+                          "applyToMultipleResourcesParameter": "resources",
+                          "title": "Remove Diagnostic Setting",
+                          "description": "Deletes the Sentinel-Diagnostics diagnostic setting from the selected resources. Only removes the setting named 'Sentinel-Diagnostics'.",
+                          "actionName": "Remove Sentinel-Diagnostics",
+                          "runLabel": "Remove Sentinel-Diagnostics",
+                          "body": ""
+                        }
+                      }
+                    ]
+                  },
+                  "name": "links-apps"
+                }
+              ]
+            },
+            "conditionalVisibility": {
+              "parameterName": "EnableDiagnostics",
+              "comparison": "isEqualTo",
+              "value": "true"
+            },
+            "name": "group-arm-apps"
+          }
+        ]
+      },
+      "conditionalVisibility": {
+        "parameterName": "mainTab",
+        "comparison": "isEqualTo",
+        "value": "apps"
+      },
+      "name": "group-apps"
+    }
+  ],
+  "fromTemplateId": "sentinel-UserWorkbook",
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}
