@@ -1,0 +1,61 @@
+// UEBA-Correlated Sensitive Operations
+// Description: Joins high-risk Key Vault operations (deletion, purging, etc.) with Microsoft's Behavior Analytics signals to flag potentially compromised accounts performing destructive actions.
+
+let SensitiveOps = dynamic([
+    "VaultDelete","VaultPatch",
+    "KeyDelete","SecretDelete","SecretPurge","KeyPurge",
+    "SecretBackup","KeyBackup","CertificateDelete","CertificatePurge",
+    "SecretSet","KeyCreate","KeyImport",
+    "CertificateCreate","CertificateImport","CertificateUpdate"
+]);
+let UEBASignals = BehaviorAnalytics
+| where TimeGenerated > ago(7d)
+| where ActivityType in ("Administrative","DataAccess","CloudLogon")
+| extend UserName = tolower(tostring(UserName))
+| summarize MaxPriority = max(InvestigationPriority),
+            BlastRadius = any(tostring(UsersInsights.BlastRadius)),
+            FirstTimeAction = countif(tobool(ActivityInsights.FirstTimeUserPerformedAction) == true),
+            FirstTimeFromCountry = countif(tobool(ActivityInsights.FirstTimeConnectionFromCountryObservedInTenant) == true),
+            FirstTimeInTenant = countif(tobool(ActivityInsights.FirstTimeActionPerformedInTenant) == true),
+            AadUserId = any(tostring(UsersInsights.AccountObjectID)),
+            SourceCountries = make_set(SourceIPLocation, 10)
+    by UserName;
+let KVActivity = AzureDiagnostics
+| where TimeGenerated > ago(7d)
+| where ResourceType =~ "VAULTS" and ResultType =~ "Success"
+| where OperationName in (SensitiveOps)
+| extend CallerUPN = tolower(coalesce(
+    column_ifexists("identity_claim_upn_s",""),
+    column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s",""))),
+    CallerObjectId = coalesce(
+        column_ifexists("identity_claim_oid_g",""),
+        column_ifexists("identity_claim_http_schemas_microsoft_com_identity_claims_objectidentifier_g","")),
+    requestUri_s = column_ifexists("requestUri_s",""),
+    clientInfo_s = column_ifexists("clientInfo_s",""),
+    CallerIPAddress = column_ifexists("CallerIPAddress","")
+| where isnotempty(CallerUPN)
+| summarize KVEventCount = count(),
+            KVOperations = make_set(OperationName, 20),
+            KVVaults = make_set(Resource, 20),
+            KVIPs = make_set(CallerIPAddress, 10),
+            KVSecrets = make_set(requestUri_s, 30),
+            KVUserAgents = make_set(clientInfo_s, 5),
+            FirstKVEvent = min(TimeGenerated),
+            LastKVEvent = max(TimeGenerated)
+    by CallerUPN, CallerObjectId;
+KVActivity
+| join kind=leftouter UEBASignals on $left.CallerUPN == $right.UserName
+| join kind=leftouter (
+    IdentityInfo
+    | where TimeGenerated > ago(14d)
+    | summarize arg_max(TimeGenerated,*) by AccountObjectId
+    | project AccountObjectId, Department, JobTitle, Manager, AccountDisplayName
+) on $left.CallerObjectId == $right.AccountObjectId
+| extend UEBARiskScore = (iff(BlastRadius =~ "High", 40, iff(isempty(BlastRadius), 10, 20)))
+    + (iff(FirstTimeAction > 0, 20, 0))
+    + (iff(FirstTimeFromCountry > 0, 20, 0))
+    + (iff(FirstTimeInTenant > 0, 15, 0))
+    + (iff(KVEventCount > 20, 15, 5))
+    + coalesce(MaxPriority, 0)
+| project-reorder FirstKVEvent, LastKVEvent, CallerUPN, AccountDisplayName, Department, JobTitle, Manager, BlastRadius, UEBARiskScore, MaxPriority, FirstTimeAction, FirstTimeFromCountry, FirstTimeInTenant, KVEventCount, KVOperations, KVVaults, KVSecrets, KVIPs, KVUserAgents, SourceCountries
+| sort by UEBARiskScore desc
