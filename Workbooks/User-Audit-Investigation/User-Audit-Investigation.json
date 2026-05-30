@@ -1,1 +1,1310 @@
-{}
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# 🔐 User Audit - Investigation Workbook\n\n**Built for SOC teams • Powered by Microsoft Sentinel • Real-time Threat Detection**\n**For more information visit https://www.itprofessor.cloud/**\n\n> 📊 **Quick Stats**: Use the fields below to launch investigations.\n\n---"
+      },
+      "name": "workbook_header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "### 📋 How to Use This Workbook\n\n**Step 1:** Enter the target user's UPN (email address) and select your time range\n\n**Step 2:** Navigate through tabs to build a complete timeline of user activity\n\n**Step 3:** Look for anomalies in each tab - risk indicators are color-coded\n\n**Step 4:** Export suspicious activities to CSV for incident response teams"
+      },
+      "name": "instructions_panel"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "user_upn_param",
+            "version": "KqlParameterItem/1.0",
+            "name": "UserUPN",
+            "label": "👤 User UPN",
+            "type": 1,
+            "description": "Enter the user's UPN (e.g., user@domain.com)",
+            "value": "",
+            "required": true
+          },
+          {
+            "id": "time_range_param",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "label": "⏱️ Time Range",
+            "type": 4,
+            "value": {
+              "durationMs": 7776000000
+            },
+            "typeSettings": {
+              "selectableValues": [
+                {
+                  "durationMs": 86400000
+                },
+                {
+                  "durationMs": 604800000
+                },
+                {
+                  "durationMs": 1209600000
+                },
+                {
+                  "durationMs": 2592000000
+                },
+                {
+                  "durationMs": 5184000000
+                },
+                {
+                  "durationMs": 7776000000
+                }
+              ],
+              "allowCustom": true
+            }
+          }
+        ],
+        "style": "above",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces"
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n### 🎯 Investigation Tabs\n\nSelect a tab below to explore different aspects of user activity:\n\n| Tab | Focus | Key Insights |\n|-----|-------|---------------|\n| 🔍 **Identity** | User profile & devices | Role, groups, device health |\n| 🗺️ **Access Footprint** | Login patterns & locations | Geographic anomalies, failed attempts |\n| 📋 **Activity Trail** | Actions & alerts | Sentinel alerts, app access |\n| 📧 **Data & Communication** | Files & email | Sharing patterns, attachments |\n| ⚠️ **Exfiltration** | Data extraction patterns | Bulk downloads, personal email |\n| 💣 **Sabotage** | Destructive actions | Mass deletions, permission changes |\n| 🔐 **Track Covering** | Evidence hiding | Audit manipulation, email purge |\n| 📈 **Timeline** | Activity spikes | Risk score trends, anomalies |\n\n---"
+      },
+      "name": "tab_guide"
+    },
+    {
+      "type": 11,
+      "content": {
+        "version": "LinkItem/1.0",
+        "style": "tabs",
+        "links": [
+          {
+            "id": "identity_tab",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "🔍 Identity & Profile",
+            "subTarget": "Identity",
+            "style": "link"
+          },
+          {
+            "id": "access_footprint_tab",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "🗺️ Access Footprint",
+            "subTarget": "AccessFootprint",
+            "style": "link"
+          },
+          {
+            "id": "activity_trail_tab",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "📋 Activity Trail",
+            "subTarget": "ActivityTrail",
+            "style": "link"
+          },
+          {
+            "id": "data_communication_tab",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "📧 Data & Communication",
+            "subTarget": "DataComm",
+            "style": "link"
+          },
+          {
+            "id": "exfiltration_tab",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "⚠️ Exfiltration Patterns",
+            "subTarget": "Exfiltration",
+            "style": "link"
+          },
+          {
+            "id": "sabotage_tab",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "💣 Sabotage & Destruction",
+            "subTarget": "Sabotage",
+            "style": "link"
+          },
+          {
+            "id": "tracecovering_tab",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "🔐 Track Covering",
+            "subTarget": "TraceCovering",
+            "style": "link"
+          },
+          {
+            "id": "timeline_tab",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "📈 Activity Timeline",
+            "subTarget": "Timeline",
+            "style": "link"
+          }
+        ]
+      },
+      "name": "tab_navigation"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 🔍 Part 1: Establishing Identity\n\n**Objective:** Who are we investigating? Establish the baseline context of the user's role, groups, and access profile.\n\n**Look for:**\n- Unexpected group memberships or privileged roles\n- Recently disabled accounts\n- Device trust issues (unmanaged devices, jailbroken phones)\n- Unusual geographic device registration\n\n---"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Identity"
+      },
+      "name": "enhanced_identity_header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "# 🔍 Part 1: Establishing Identity\n\nWho are we investigating? Establish the baseline context of the user's role, groups, and access profile."
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Identity"
+      },
+      "name": "identity_header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nlet UserPrincipalName_ = tostring(UserUPN);\nSigninLogs\n| where TimeGenerated >= ago(7d)\n| where UserPrincipalName contains UserPrincipalName_\n| extend DeviceBrowser = tostring(DeviceDetail.browser)\n| extend DeviceId = tostring(DeviceDetail.deviceId)\n| extend DeviceDisplayName = tostring(DeviceDetail.displayName)\n| extend DeviceOperatingSystem = tostring(DeviceDetail.operatingSystem)\n| extend DeviceTrustType = tostring(DeviceDetail.trustType)\n| extend DeviceIsManaged = tostring(DeviceDetail.isManaged)\n| extend City = tostring(LocationDetails.city)\n| extend CountryOrRegion = tostring(LocationDetails.countryOrRegion)\n| extend State = tostring(LocationDetails.state)\n| extend StatusAdditionalDetails = tostring(Status.additionalDetails)\n| extend StatusFailureReason = tostring(Status.failureReason)\n| project TimeGenerated, OperationName, UserDisplayName, UserPrincipalName, IPAddress, UserType, UserId, AuthenticationRequirement, AppDisplayName, AppId, ClientAppUsed, Location, RiskDetail, RiskState, IsRisky, RiskLevelDuringSignIn, DeviceDisplayName, DeviceBrowser, DeviceId, DeviceOperatingSystem, DeviceTrustType, City, State, StatusAdditionalDetails, StatusFailureReason, AutonomousSystemNumber, CrossTenantAccessType\n| summarize arg_max(TimeGenerated, *) by UserDisplayName, DeviceDisplayName, DeviceId, DeviceTrustType\n| project UserDisplayName, DeviceDisplayName, DeviceId, DeviceTrustType, DeviceOperatingSystem, DeviceBrowser",
+        "size": 0,
+        "title": "🖥️ Associated Devices",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "DeviceIsManaged",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "colors",
+                "thresholdsGrid": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "True",
+                    "representation": "success",
+                    "text": "Managed"
+                  },
+                  {
+                    "operator": "==",
+                    "thresholdValue": "False",
+                    "representation": "4",
+                    "text": "Unmanaged"
+                  }
+                ]
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Identity"
+      },
+      "customWidth": "100",
+      "name": "query_device_analysis"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nIdentityInfo\n| where AccountUPN == UserUPN\n| project AccountUPN, GivenName, Surname, GroupMembership, Department, JobTitle, IsAccountEnabled, UserType",
+        "size": 4,
+        "title": "📄 Official Identity Record",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "IsAccountEnabled",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "icons",
+                "thresholdsGrid": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "true",
+                    "representation": "success",
+                    "text": "Enabled"
+                  },
+                  {
+                    "operator": "==",
+                    "thresholdValue": "false",
+                    "representation": "4",
+                    "text": "Disabled"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Identity"
+      },
+      "customWidth": "50",
+      "name": "query_identity_record"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nSigninLogs\n| where ResultType == 0\n| where UserPrincipalName == UserUPN\n| take 1\n| project UserProfile = strcat(\"https://portal.azure.com/#blade/Microsoft_AAD_IAM/UserDetailsMenuBlade/Profile/userId/\", UserId)",
+        "size": 4,
+        "title": "🔗 Direct Link to Entra ID Profile",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "UserProfile",
+              "formatter": 7,
+              "formatOptions": {
+                "linkTarget": "Url",
+                "linkLabel": "Open in Azure Portal"
+              }
+            }
+          ]
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Identity"
+      },
+      "customWidth": "50",
+      "name": "query_entra_link"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 🗺️ Part 2: The Access Footprint\n\n**Objective:** Where and how has this user been active? Sign-in patterns, devices, locations, and failed login attempts.\n\n**Look for:**\n- Impossible travel scenarios (different geographic locations in short timeframes)\n- Logins from unusual countries or VPNs\n- Multiple failed authentication attempts\n- After-hours access patterns\n- New devices or browsers\n\n---"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "AccessFootprint"
+      },
+      "name": "enhanced_access_header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "# 🗺️ Part 2: The Access Footprint\n\nWhere and how has this user been active? Sign-in patterns, devices, locations, and failed login attempts."
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "AccessFootprint"
+      },
+      "name": "access_header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nSigninLogs\n| where UserPrincipalName has UserUPN\n| extend City = tostring(LocationDetails.city),\n         State = tostring(LocationDetails.state),\n         CountryOrRegion = tostring(LocationDetails.countryOrRegion),\n         DeviceDisplayName = tostring(DeviceDetail.displayName),\n         DeviceOperatingSystem = tostring(DeviceDetail.operatingSystem),\n         StatusFailureReason = tostring(Status.failureReason)\n| project TimeGenerated,\n          OperationName,\n          UserDisplayName,\n          IPAddress,\n          UserType,\n          AppDisplayName,\n          ClientAppUsed,\n          Location,\n          DeviceDisplayName,\n          DeviceOperatingSystem,\n          City,\n          State,\n          CountryOrRegion,\n          StatusFailureReason\n| sort by TimeGenerated desc",
+        "size": 0,
+        "title": "📊 Full-Spectrum Sign-in Report",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "TimeGenerated",
+              "formatter": 6,
+              "formatOptions": {
+                "dateFormat": {
+                  "showUtcTime": null,
+                  "x": "yyyy-MM-dd HH:mm:ss"
+                }
+              }
+            },
+            {
+              "columnMatch": "StatusFailureReason",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "icons",
+                "thresholdsGrid": [
+                  {
+                    "operator": "isNotEmpty",
+                    "representation": "4",
+                    "text": "Failed"
+                  },
+                  {
+                    "operator": "==",
+                    "thresholdValue": "null",
+                    "representation": "success",
+                    "text": "Success"
+                  }
+                ]
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "AccessFootprint"
+      },
+      "customWidth": "100",
+      "name": "query_signin_spectrum"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nSigninLogs\n| where UserPrincipalName has UserUPN\n| summarize arg_max(TimeGenerated, *) by UserPrincipalName\n| project TimeGenerated,\n          UserPrincipalName,\n          AppDisplayName,\n          IPAddress,\n          Location = LocationDetails,\n          DeviceDetail,\n          ConditionalAccessStatus,\n          UserType",
+        "size": 4,
+        "title": "🎯 Last Known Location",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "TimeGenerated",
+              "formatter": 6,
+              "formatOptions": {
+                "dateFormat": {
+                  "showUtcTime": null,
+                  "x": "yyyy-MM-dd HH:mm:ss"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "AccessFootprint"
+      },
+      "customWidth": "100",
+      "name": "query_last_location"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 📋 Part 3: The Activity Trail\n\n**Objective:** What actions did the user take? Security alerts, audit logs, application access, and suspicious activities.\n\n**Look for:**\n- High-confidence security alerts\n- Unusual administrative operations\n- Access to sensitive applications\n- Multiple failed authentication attempts\n- Privilege elevation attempts\n\n---"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "ActivityTrail"
+      },
+      "name": "enhanced_activity_header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "# 📋 Part 3: The Activity Trail\n\nWhat actions did the user take? Security alerts, audit logs, application access, and suspicious activities."
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "ActivityTrail"
+      },
+      "name": "activity_header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nSecurityAlert\n| mv-expand todynamic(Entities)\n| extend EntityName = tostring(Entities.DisplayName)\n| where isnotempty(EntityName)\n| where Entities contains UserUPN\n| project TimeGenerated, AlertName, Description, ProviderName, ConfidenceLevel, EntityName\n| sort by TimeGenerated desc",
+        "size": 0,
+        "title": "⚠️ Recent Sentinel Alerts",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "ConfidenceLevel",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "colors",
+                "thresholdsGrid": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "High",
+                    "representation": "redBright",
+                    "text": "High"
+                  },
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Medium",
+                    "representation": "yellow",
+                    "text": "Medium"
+                  },
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Low",
+                    "representation": "blue",
+                    "text": "Low"
+                  }
+                ]
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "ActivityTrail"
+      },
+      "customWidth": "100",
+      "name": "query_alerts"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nAuditLogs\n| extend InitiatorUPN = tostring(InitiatedBy.user.userPrincipalName)\n| where isnotempty(InitiatorUPN) and InitiatorUPN has UserUPN\n| mv-expand TargetResources\n| extend TargetUPN = tostring(TargetResources.userPrincipalName),\n         ModifiedProperties = TargetResources.modifiedProperties\n| project TimeGenerated,\n          InitiatorUPN,\n          OperationName,\n          ActivityDisplayName,\n          TargetUPN,\n          Result,\n          ResultReason,\n          ModifiedProperties\n| sort by TimeGenerated desc",
+        "size": 0,
+        "title": "📝 Entra ID Audit Trail",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Result",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "colors",
+                "thresholdsGrid": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Success",
+                    "representation": "success",
+                    "text": "Success"
+                  },
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Failure",
+                    "representation": "4",
+                    "text": "Failure"
+                  }
+                ]
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "ActivityTrail"
+      },
+      "customWidth": "100",
+      "name": "query_audit_logs"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nSigninLogs\n| where UserPrincipalName == UserUPN\n| summarize AppAccessCount = count() by AppDisplayName\n| where isnotempty(AppDisplayName)\n| top 50 by AppAccessCount desc",
+        "size": 0,
+        "title": "🎯 Top Applications Accessed",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "AppAccessCount",
+              "formatter": 3,
+              "formatOptions": {
+                "palette": "blue"
+              }
+            }
+          ]
+        },
+        "chartSettings": {
+          "xAxis": "AppDisplayName",
+          "yAxis": [
+            "AppAccessCount"
+          ]
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "ActivityTrail"
+      },
+      "customWidth": "100",
+      "name": "query_top_apps"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 📧 Part 4: Data and Communication Trail\n\n**Objective:** File access, sharing, downloads, and email communications.\n\n**Look for:**\n- Mass file downloads or access\n- File sharing to external parties\n- Bulk uploads to cloud services\n- Email sent to personal accounts\n- Suspicious attachment patterns\n\n---"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "DataComm"
+      },
+      "name": "enhanced_datacomm_header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "# 📧 Part 4: Data and Communication Trail\n\nFile access, sharing, downloads, and email communications."
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "DataComm"
+      },
+      "name": "data_comm_header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where RecordType == \"SharePointFileOperation\"\n| where UserId has UserUPN and Operation in (\"FileAccessed\", \"FileDownloaded\")\n| project TimeGenerated, UserId, Operation, SourceFileName, Site_Url, OfficeWorkload, ClientIP\n| where SourceFileName !contains \".aspx\"\n| sort by TimeGenerated desc",
+        "size": 0,
+        "title": "📁 Files Accessed & Downloaded",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "TimeGenerated",
+              "formatter": 6,
+              "formatOptions": {
+                "dateFormat": {
+                  "showUtcTime": null,
+                  "x": "yyyy-MM-dd HH:mm:ss"
+                }
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "DataComm"
+      },
+      "customWidth": "100",
+      "name": "query_file_access"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where RecordType == \"SharePointFileOperation\"\n| where UserId has UserUPN and Operation in (\"FileAccessed\", \"FileDownloaded\")\n| where SourceFileName !contains \".aspx\"\n| summarize Count = count() by bin(TimeGenerated,1d), Operation\n",
+        "size": 0,
+        "title": "📊 File Access Activity - Count by Date & Operation Type",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart",
+        "chartSettings": {
+          "xAxis": "TimeGenerated",
+          "seriesLabelSettings": [
+            {
+              "seriesName": "Operation",
+              "label": "Operation Type"
+            }
+          ],
+          "xSettings": {
+            "label": "Date"
+          }
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "DataComm"
+      },
+      "customWidth": "100",
+      "name": "query_file_access_chart"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where Operation in (\"SecureLinkCreated\", \"AddedToSecureLink\", \"SharingLinkUpdated\", \"SharingLinkCreated\", \"AnonymousLinkCreated\")\n| where UserId has UserUPN\n| project \n    TimeGenerated,\n    UserId,\n    Operation,\n    SourceFileName,\n    Site_Url,\n    TargetUserOrGroupName,\n    OfficeObjectId,\n    ClientIP\n| sort by TimeGenerated desc",
+        "size": 0,
+        "title": "🔗 File Sharing Activity",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "TimeGenerated",
+              "formatter": 6,
+              "formatOptions": {
+                "dateFormat": {
+                  "showUtcTime": null,
+                  "x": "yyyy-MM-dd HH:mm:ss"
+                }
+              }
+            },
+            {
+              "columnMatch": "Operation",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "colors",
+                "thresholdsGrid": [
+                  {
+                    "operator": "contains",
+                    "thresholdValue": "Anonymous",
+                    "representation": "redBright",
+                    "text": "ANON"
+                  },
+                  {
+                    "operator": "contains",
+                    "thresholdValue": "Link",
+                    "representation": "orange",
+                    "text": "LINK"
+                  }
+                ]
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "DataComm"
+      },
+      "customWidth": "100",
+      "name": "query_file_sharing"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where UserId == UserUPN\n| where Operation in (\"FileAccessed\", \"FileDownloaded\", \"FileModified\", \"FileUploaded\")\n| summarize AccessCount = count() by SourceFileName, SourceFileExtension, Operation\n| where isnotempty(SourceFileName)\n| top 50 by AccessCount desc",
+        "size": 0,
+        "title": "📊 Most Frequently Accessed Files",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "AccessCount",
+              "formatter": 3,
+              "formatOptions": {
+                "palette": "green"
+              }
+            }
+          ]
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "DataComm"
+      },
+      "customWidth": "100",
+      "name": "query_frequent_files"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nEmailEvents\n| where SenderFromAddress == UserUPN and EmailDirection == \"Outbound\"\n| project TimeGenerated, RecipientEmailAddress, Subject, ThreatTypes, DetectionMethods\n| where RecipientEmailAddress !contains \"journaling\"\n| sort by TimeGenerated desc",
+        "size": 0,
+        "title": "📮 Outbound Email Traffic",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "DataComm"
+      },
+      "customWidth": "100",
+      "name": "query_email_outbound"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nEmailAttachmentInfo\n| where SenderFromAddress has UserUPN\n| extend FileName_Lower = tolower(FileName)\n// Filter by length: GUID filenames are typically 32-36 chars long. \n| where not(\n    FileType in (\"png\", \"jpg\", \"jpeg\", \"gif\", \"bmp\") and \n    strlen(FileName) >= 32 and strlen(FileName) <= 40\n)\n| project \n    TimeGenerated, \n    FileName, \n    FileType, \n    SHA256, \n    SenderFromAddress, \n    RecipientEmailAddress\n| sort by TimeGenerated desc\n",
+        "size": 0,
+        "title": "📎 Email Attachment Forensics",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "DataComm"
+      },
+      "customWidth": "100",
+      "name": "query_attachments"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## ⚠️ Part 5: Exfiltration Patterns\n\n**Objective:** Bulk downloads, archive creation, suspicious cloud storage access, and data extraction attempts.\n\n**Red Flags:**\n- Downloads > 100MB in short timeframe\n- Access to personal email accounts\n- Cloud storage uploads (OneDrive, Dropbox)\n- Archive file downloads (.zip, .rar, .7z)\n- After-hours exfiltration\n\n---"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Exfiltration"
+      },
+      "name": "enhanced_exfiltration_header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "# ⚠️ Part 5: Exfiltration Patterns\n\nBulk downloads, archive creation, suspicious cloud storage access, and data extraction attempts."
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Exfiltration"
+      },
+      "name": "exfiltration_header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where UserId == UserUPN\n| where Operation in (\"FileDownloaded\", \"FileAccessed\")\n| project\n    TimeGenerated,\n    UserId,\n    Operation,\n    SourceFileName,\n    Site_Url,\n    ClientIP,\n    UserAgent\n| where SourceFileName !contains \".aspx\"\n| where SourceFileName !contains \"theme\"\n| order by TimeGenerated desc",
+        "size": 0,
+        "title": "⬇️Downloads Detection",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "TimeGenerated",
+              "formatter": 6,
+              "formatOptions": {
+                "dateFormat": {
+                  "showUtcTime": null,
+                  "x": "yyyy-MM-dd HH:mm:ss"
+                }
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Exfiltration"
+      },
+      "customWidth": "100",
+      "name": "query_download_spike"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where UserId == UserUPN\n| where Operation in (\"FileDownloaded\", \"FileAccessed\")\n| where SourceFileName !contains \".aspx\"\n| summarize Count = count() by bin(TimeGenerated,1d), Operation",
+        "size": 0,
+        "title": "📊 Downloads - Count by Date & Operation",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart",
+        "chartSettings": {
+          "xAxis": "TimeGenerated",
+          "seriesLabelSettings": [
+            {
+              "seriesName": "Operation",
+              "label": "Action"
+            }
+          ],
+          "xSettings": {
+            "label": "Date"
+          }
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Exfiltration"
+      },
+      "customWidth": "100",
+      "name": "query_download_chart"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nlet PersonalDomains = @\"(gmail\\.com|yahoo\\.com|outlook\\.com|hotmail\\.com|icloud\\.com)\";\nEmailEvents\n| where SenderFromAddress == UserUPN\n| where EmailDirection == \"Outbound\"\n| extend RecipientDomain = tostring(extract(@\"@(.+)\", 1, RecipientEmailAddress))\n| where RecipientDomain matches regex PersonalDomains\n| project\n    TimeGenerated,\n    SenderFromAddress,\n    RecipientEmailAddress,\n    RecipientDomain,\n    Subject,\n    AttachmentCount,\n    EmailSize,\n    DeliveryAction,\n    DeliveryLocation\n| order by TimeGenerated desc",
+        "size": 0,
+        "title": "🚨 Personal Email Exfiltration (Gmail/Yahoo/Outlook)",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "RecipientDomain",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "colors",
+                "thresholdsGrid": [
+                  {
+                    "operator": "isNotEmpty",
+                    "representation": "redBright",
+                    "text": "EXFILTRATION RISK"
+                  }
+                ]
+              }
+            },
+            {
+              "columnMatch": "AttachmentCount",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "colors",
+                "thresholdsGrid": [
+                  {
+                    "operator": ">",
+                    "thresholdValue": "0",
+                    "representation": "redBright",
+                    "text": "HAS ATTACHMENTS"
+                  }
+                ]
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Exfiltration"
+      },
+      "customWidth": "100",
+      "name": "query_personal_email"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where UserId == UserUPN\n| where RecordType == \"SharePointSharingOperation\"\n| where Operation in (\"SharingLinkCreated\", \"AnonymousLinkCreated\", \"AddedToSecureLink\")\n| extend TargetAddress = tostring(TargetUserOrGroupName)\n| extend TargetDomain = tostring(extract(@\"@(.+)\", 1, TargetAddress))\n| project\n    TimeGenerated,\n    UserId,\n    Operation,\n    Site_Url,\n    OfficeObjectId,\n    SourceFileName,\n    TargetAddress,\n    TargetDomain,\n    TargetUserOrGroupType\n| order by TimeGenerated desc",
+        "size": 0,
+        "title": "☁️ Cloud Storage Access & Anonymous Sharing",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "TimeGenerated",
+              "formatter": 6,
+              "formatOptions": {
+                "dateFormat": {
+                  "showUtcTime": null,
+                  "x": "yyyy-MM-dd HH:mm:ss"
+                }
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Exfiltration"
+      },
+      "customWidth": "100",
+      "name": "query_cloud_storage"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 💣 Part 6: Sabotage & Destruction Patterns\n\n**Objective:** Mass file deletion, permission removal, intentional destruction of data and access controls.\n\n**Critical Indicators:**\n- Deletion of entire folders/libraries\n- Permanent file purging (not recycle bin)\n- Removal of owners/members from groups\n- Bulk permission changes\n- Targeted project/team deletions\n\n---"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Sabotage"
+      },
+      "name": "enhanced_sabotage_header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "# 💣 Part 6: Sabotage & Destruction Patterns\n\nMass file deletion, permission removal, intentional destruction of data and access controls."
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Sabotage"
+      },
+      "name": "sabotage_header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where UserId == UserUPN\n| where Operation in (\n    \"FileDeleted\",\n    \"FolderDeleted\",\n    \"DeleteFileVersion\",\n    \"PermanentlyDeletedFile\",\n    \"RecycleBinEmptied\",\n    \"FileRecycled\",\n    \"FileDeletedFirstStageRecycleBin\"\n)\n| project\n    TimeGenerated,\n    UserId,\n    Operation,\n    SourceFileName,\n    Site_Url,\n    ClientIP\n| order by TimeGenerated desc",
+        "size": 0,
+        "title": "🗑️ Mass File Deletion",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "TimeGenerated",
+              "formatter": 6,
+              "formatOptions": {
+                "dateFormat": {
+                  "showUtcTime": null,
+                  "x": "yyyy-MM-dd HH:mm:ss"
+                }
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Sabotage"
+      },
+      "customWidth": "100",
+      "name": "query_mass_deletion"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where UserId == UserUPN\n| where Operation in (\n    \"FileDeleted\",\n    \"FolderDeleted\",\n    \"DeleteFileVersion\",\n    \"PermanentlyDeletedFile\",\n    \"RecycleBinEmptied\",\n    \"FileRecycled\",\n    \"FileDeletedFirstStageRecycleBin\"\n)\n| summarize Count = count() by bin(TimeGenerated,1d), Operation",
+        "size": 0,
+        "title": "📊 File Deletions - Count by Date & Deletion Type",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart",
+        "chartSettings": {
+          "xAxis": "TimeGenerated",
+          "seriesLabelSettings": [
+            {
+              "seriesName": "Operation",
+              "label": "Deletion Type"
+            }
+          ],
+          "xSettings": {
+            "label": "Date"
+          }
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Sabotage"
+      },
+      "customWidth": "100",
+      "name": "query_mass_deletion_chart"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nAuditLogs\n| where InitiatedBy.user.userPrincipalName == UserUPN\n       or InitiatedBy.app.displayName == UserUPN\n| where OperationName in (\"Remove member from group\",\n                          \"Add member to group\",\n                          \"Update group\",\n                          \"Remove app role assignment member\",\n                          \"Remove owner from group\")\n| extend\n    Actor = tostring(InitiatedBy.user.userPrincipalName),\n    ActorIP = tostring(InitiatedBy.user.ipAddress)\n| extend\n    UserRemoved = tostring(TargetResources[0].userPrincipalName),\n    GroupName = tostring(parse_json(tostring(parse_json(tostring(TargetResources[0].modifiedProperties))[1].oldValue))),\n    GroupId = tostring(TargetResources[1].id),\n    ModifiedProps = tostring(TargetResources[0].modifiedProperties)\n| project\n    TimeGenerated,\n    OperationName,\n    Actor,\n    ActorIP,\n    UserRemoved,\n    GroupName,\n    GroupId,\n    ModifiedProps\n| order by TimeGenerated desc\n",
+        "size": 0,
+        "title": "🔐 Permission Change (Group/Owner Removal)",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "OperationName",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "colors",
+                "thresholdsGrid": [
+                  {
+                    "operator": "contains",
+                    "thresholdValue": "Remove",
+                    "representation": "redBright",
+                    "text": "REMOVAL"
+                  }
+                ]
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Sabotage"
+      },
+      "customWidth": "100",
+      "name": "query_permission_sabotage"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 🔐 Part 7: Track Covering\n\n**Objective:** Audit log manipulation, email purge, and attempts to hide evidence of malicious activity.\n\n**Smoking Gun Indicators:**\n- Audit log configuration changes\n- Bulk email deletion\n- Mailbox forwarding rules\n- Removal of admin logs\n- Disabled email retention\n\n---"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "TraceCovering"
+      },
+      "name": "enhanced_tracecovering_header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "# 🔐 Part 7: Track Covering\n\nAudit log manipulation, email purge, and attempts to hide evidence of malicious activity."
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "TraceCovering"
+      },
+      "name": "tracecovering_header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where RecordType == \"ExchangeAdmin\"\n| where UserId == UserUPN\n| where Operation in (\n    \"Set-AdminAuditLogConfig\"\n)\n| extend\n    Parameters = todynamic(Parameters),\n    ParametersList = tostring(Parameters)\n| project\n    TimeGenerated,\n    UserId,\n    Operation,\n    OfficeObjectId,\n    ClientIP,\n    ResultStatus,\n    ParametersList,\n    OriginatingServer,\n    UserType,\n    OfficeWorkload\n| order by TimeGenerated desc",
+        "size": 0,
+        "title": "🚨 Audit Log Manipulation Attempt",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "ResultStatus",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "colors",
+                "thresholdsGrid": [
+                  {
+                    "operator": "!=",
+                    "thresholdValue": "Failed",
+                    "representation": "redBright",
+                    "text": "SUCCESS - AUDIT COMPROMISED"
+                  }
+                ]
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "TraceCovering"
+      },
+      "customWidth": "100",
+      "name": "query_audit_manipulation"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where RecordType == \"ExchangeItemGroup\"\n| where UserId == UserUPN\n| where Operation == \"MoveToDeletedItems\"\n| extend Items = todynamic(AffectedItems)\n| project \n    TimeGenerated,\n    UserId,\n    Operation,\n    ClientIP,\n    ItemCount = array_length(Items),\n    OfficeWorkload\n| order by TimeGenerated desc",
+        "size": 0,
+        "title": "📧 Email Purge Detection (Sent/Deleted Items)",
+        "timeContextFromParameter": "TimeRange",
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "TimeGenerated",
+              "formatter": 6,
+              "formatOptions": {
+                "dateFormat": {
+                  "showUtcTime": null,
+                  "x": "yyyy-MM-dd HH:mm:ss"
+                }
+              }
+            }
+          ],
+          "filter": true
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "TraceCovering"
+      },
+      "customWidth": "100",
+      "name": "query_email_purge"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where RecordType == \"ExchangeItemGroup\"\n| where UserId == UserUPN\n| where Operation == \"MoveToDeletedItems\"\n| extend Items = todynamic(AffectedItems)\n| summarize Count = count() by bin(TimeGenerated, 1d)",
+        "size": 0,
+        "title": "📊 Email Purges - Events by Date",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "TraceCovering"
+      },
+      "customWidth": "100",
+      "name": "query_email_purge_chart"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 📈 Part 8: Activity Timeline & Spike Analysis\n\n**Objective:** Visual timeline of suspicious activity spikes before departure or incident events.\n\n**Pattern Analysis:**\n- Look for coordinated spikes across multiple activity types\n- Compare baseline activity to spike periods\n- Identify time-based patterns (before resignations, vacations)\n- Calculate risk score trends\n\n---"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Timeline"
+      },
+      "name": "enhanced_timeline_header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "# 📈 Part 8: Activity Timeline & Spike Analysis\n\nVisual timeline of suspicious activity spikes before departure or incident events."
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Timeline"
+      },
+      "name": "timeline_header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where UserId == UserUPN\n| where Operation in (\n    \"FileDownloaded\", \"FileAccessed\", \"FileCopied\", \"SharingLinkCreated\", \"AnonymousLinkCreated\",\n    \"MoveToDeletedItems\", \"SoftDelete\", \"HardDelete\",\n    \"Set-AdminAuditLogConfig\"\n)\n| summarize ActivityCount = count() by bin(TimeGenerated, 1d), Operation\n| render areachart with (title=\"Insider Risk Activity Spikes - 30 Day Timeline\", xtitle=\"Date\", ytitle=\"Activity Count\")",
+        "size": 0,
+        "title": "📊 30-Day Activity Spike Timeline",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "areachart"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Timeline"
+      },
+      "customWidth": "100",
+      "name": "query_timeline_spikes"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nOfficeActivity\n| where UserId == UserUPN\n| where Operation in (\n    \"FileDownloaded\", \"FileDeleted\", \"SharingLinkCreated\",\n    \"FileAccessed\", \"FileCopied\"\n)\n| summarize\n    Downloads = countif(Operation == \"FileDownloaded\"),\n    Deletions = countif(Operation == \"FileDeleted\"),\n    Shares = countif(Operation == \"SharingLinkCreated\"),\n    Accesses = countif(Operation == \"FileAccessed\")\n  by bin(TimeGenerated, 1d)\n| render barchart with (title=\"Suspicious Activity by Category - Daily\")",
+        "size": 0,
+        "title": "📊 Activity Breakdown by Category (Daily)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Timeline"
+      },
+      "customWidth": "100",
+      "name": "query_category_breakdown"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let UserUPN = \"{UserUPN}\";\nlet RiskActions = dynamic([\n    \"FileDownloaded\",\n    \"FileDeleted\",\n    \"SharingLinkCreated\",\n    \"AnonymousLinkCreated\",\n    \"MoveToDeletedItems\",\n    \"Set-AdminAuditLogConfig\"\n]);\nOfficeActivity\n| where UserId == UserUPN\n| where Operation in (RiskActions)\n| extend RiskScore = case(\n    Operation == \"AnonymousLinkCreated\", 10,\n    Operation == \"Set-AdminAuditLogConfig\", 9,\n    Operation == \"FileDeleted\", 7,\n    Operation == \"MoveToDeletedItems\", 6,\n    Operation == \"SharingLinkCreated\", 5,\n    Operation == \"FileDownloaded\", 3,\n    1\n)\n| summarize TotalRiskScore = sum(RiskScore), EventCount = count() by bin(TimeGenerated, 1d)\n| render areachart with (title=\"Cumulative Risk Score Over Time\", xtitle=\"Date\", ytitle=\"Risk Score\")",
+        "size": 0,
+        "title": "⚠️ Cumulative Risk Score Timeline",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "areachart"
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "Timeline"
+      },
+      "customWidth": "100",
+      "name": "query_risk_score"
+    }
+  ],
+  "fromTemplateId": "sentinel-UserWorkbook",
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}
