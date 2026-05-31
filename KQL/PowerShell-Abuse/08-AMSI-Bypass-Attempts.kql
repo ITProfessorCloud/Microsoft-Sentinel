@@ -1,0 +1,5 @@
+// AMSI Bypass Attempts
+// Description: Detects attempts to bypass or disable AMSI (Antimalware Scan Interface) which is commonly used by attackers to evade detection
+// Blog: https://www.itprofessor.cloud/hunting-powershell-abuse-mde-kql/
+
+// TODO: Add KQL query here
