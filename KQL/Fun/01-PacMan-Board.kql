@@ -1,0 +1,4 @@
+// PacMan Board ASCII Art
+// Description: Generates ASCII art PacMan board using KQL render functions
+
+// TODO: Add KQL query here (copy from PacManBoard.yaml)
