@@ -1,4 +1,60 @@
-// High Special Character Ratio Obfuscation
-// Description: Targets obfuscation tools like Invoke-Obfuscation by measuring the ratio of special characters (backticks, carets, dollar signs) to alphanumeric characters.
-
-// TODO: Add KQL query here
+// ============================================================
+// Hunt: High Special Character Ratio Obfuscation
+// MITRE: T1059.001 | T1027.010 (Command Obfuscation)
+// ============================================================
+let LookbackPeriod = 7d;
+let SpecialCharThreshold = 0.30;
+let MinCommandLength     = 60;
+DeviceProcessEvents
+| where Timestamp > ago(LookbackPeriod)
+| where FileName has_any ("powershell.exe", "pwsh.exe", "powershell_ise.exe")
+| extend CmdLen = strlen(ProcessCommandLine)
+| where CmdLen >= MinCommandLength
+| extend
+    TickCount      = countof(ProcessCommandLine, "`"),
+    CaretCount     = countof(ProcessCommandLine, "^"),
+    PipeCount      = countof(ProcessCommandLine, "|"),
+    SemicolonCount = countof(ProcessCommandLine, ";"),
+    DollarCount    = countof(ProcessCommandLine, "$"),
+    PlusCount      = countof(ProcessCommandLine, "+"),
+    OpenParenCount = countof(ProcessCommandLine, "("),
+    QuoteCount     = countof(ProcessCommandLine, "'"),
+    PercentCount   = countof(ProcessCommandLine, "%")
+| extend
+    AlphaNumCount = array_length(extract_all(@"([A-Za-z0-9])", ProcessCommandLine)),
+    SpaceCount    = countof(ProcessCommandLine, " ")
+| extend
+    SpecialCharCount = CmdLen - AlphaNumCount - SpaceCount,
+    SpecialCharRatio = todouble(CmdLen - AlphaNumCount - SpaceCount) / todouble(CmdLen)
+| where SpecialCharRatio >= SpecialCharThreshold
+| extend ObfuscationClass = case(
+    TickCount > 15,                           "Backtick Insertion — Invoke-Obfuscation TOKEN/STRING",
+    CaretCount > 15,                          "Caret Passthrough — cmd.exe level obfuscation",
+    DollarCount > 20 and OpenParenCount > 15, "Variable/Subexpression Heavy — Invoke-Obfuscation VAR",
+    PlusCount > 10 and QuoteCount > 10,       "String Concatenation — char-by-char rebuilding",
+    PercentCount > 10,                        "Environment Variable Expansion — %-based evasion",
+    SpecialCharRatio > 0.55,                  "High-Density Obfuscation — charcode or compress/decompress",
+    "General Suspicious Ratio"
+)
+| extend RiskScore =
+    case(SpecialCharRatio > 0.60, 40, SpecialCharRatio > 0.45, 25, SpecialCharRatio > 0.30, 15, 0) +
+    case(TickCount  > 20, 20, TickCount  > 10, 10, 0) +
+    case(CaretCount > 20, 20, CaretCount > 10, 10, 0) +
+    case(PlusCount  > 15, 15, PlusCount  > 7,  7,  0) +
+    case(CmdLen > 1000, 15, CmdLen > 500, 7, 0)
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    CmdLen,
+    SpecialCharRatio = round(SpecialCharRatio, 3),
+    ObfuscationClass,
+    RiskScore,
+    TickCount, CaretCount, PipeCount,
+    SemicolonCount, DollarCount, PlusCount,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    SHA256,
+    ReportId
+| order by RiskScore desc, SpecialCharRatio desc, Timestamp desc
