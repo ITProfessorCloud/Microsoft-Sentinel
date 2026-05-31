@@ -1,4 +1,101 @@
-// Suspicious PowerShell Cmdlets
-// Description: Uses DeviceEvents with ActionType == PowerShellCommand to catch suspicious cmdlet execution mapping to specific attack phases like AD Recon, Credential Harvesting, and Lateral Movement.
-
-// TODO: Add KQL query here
+// ============================================================
+// Hunt: Suspicious PowerShell Commandlet Execution
+// MITRE: T1059.001 | T1482 | T1069 | T1087 | T1003 | T1021 | T1053
+// Uses DeviceEvents ActionType=PowerShellCommand for cmdlet-level
+// ============================================================
+let LookbackPeriod = 7d;
+let Phase_ADRecon = dynamic([
+    "Get-ADUser","Get-ADComputer","Get-ADGroup","Get-ADGroupMember",
+    "Get-ADDomain","Get-ADDomainController","Get-ADOrganizationalUnit",
+    "Get-ADForest","Get-ADTrust","Get-ADUserResultantPasswordPolicy",
+    "Get-ADFineGrainedPasswordPolicy","Get-ADDefaultDomainPasswordPolicy",
+    "Get-DomainUser","Get-DomainComputer","Get-DomainGroup","Get-DomainController",
+    "Get-DomainTrust","Get-DomainPolicy","Get-DomainGroupMember","Get-DomainGPO",
+    "Get-DomainOU","Get-DomainSID","Get-DomainObjectAcl","Get-ObjectAcl",
+    "Get-DomainDFSShare","Get-DomainGPOLocalGroup","Invoke-ACLScanner",
+    "Get-NetUser","Get-NetComputer","Get-NetGroup","Get-NetDomain",
+    "Get-NetForestTrust","Get-NetForest","Get-NetLocalGroup",
+    "Get-ForestTrust","Get-LocalUser","Get-LocalGroup","Get-LocalGroupMember"
+]);
+let Phase_NetworkRecon = dynamic([
+    "Invoke-Portscan","Invoke-ReverseDnsLookup",
+    "Get-NetIPAddress","Get-NetRoute","Get-NetTCPConnection",
+    "Get-NetAdapter","Get-NetFirewallRule","Get-NetShare",
+    "Resolve-DnsName"
+]);
+let Phase_CredHarvest = dynamic([
+    "Invoke-Mimikatz","Invoke-NinjaCopy","Invoke-CredentialInjection",
+    "Invoke-LSADump","Invoke-SAMDump","Out-Minidump",
+    "Get-CachedGPPPassword","Get-GPPPassword","Get-DecryptedCpassword",
+    "Get-Keystrokes","Get-TimedScreenshot","Get-ClipboardContents",
+    "ConvertFrom-SecureString","Get-VaultCredential","Get-Credential"
+]);
+let Phase_LateralMovement = dynamic([
+    "New-PSSession","Enter-PSSession","Invoke-Command",
+    "Invoke-WmiMethod","Get-WmiObject","Invoke-CimMethod","New-CimSession",
+    "Invoke-DCOM","Invoke-TokenManipulation","Invoke-RunAs",
+    "Invoke-PsExec","Invoke-SMBClient"
+]);
+let Phase_Persistence = dynamic([
+    "Register-ScheduledTask","New-ScheduledTask","Set-ScheduledTask",
+    "New-ItemProperty","Set-ItemProperty",
+    "Set-WmiInstance","New-CimInstance",
+    "Register-CimIndicationEvent"
+]);
+let Phase_DefenceEvasion = dynamic([
+    "Add-MpPreference","Set-MpPreference",
+    "Disable-WindowsOptionalFeature","Uninstall-WindowsFeature",
+    "Set-ExecutionPolicy","Bypass-UAC","Invoke-BypassUAC",
+    "Invoke-EventVwrBypass","Invoke-EnvBypass"
+]);
+let Phase_Exfil = dynamic([
+    "Invoke-Exfil","Out-Minidump",
+    "Compress-Archive","Send-MailMessage",
+    "Invoke-DNSQuery","Invoke-PowerShellTCP","Start-Socket"
+]);
+let AllSuspiciousCmdlets = array_concat(
+    Phase_ADRecon, Phase_NetworkRecon, Phase_CredHarvest,
+    Phase_LateralMovement, Phase_Persistence, Phase_DefenceEvasion, Phase_Exfil
+);
+DeviceEvents
+| where Timestamp > ago(LookbackPeriod)
+| where ActionType == "PowerShellCommand"
+| extend Commandlet = tostring(parse_json(AdditionalFields).Command)
+| where Commandlet has_any (AllSuspiciousCmdlets)
+| extend AttackPhase = case(
+    Commandlet has_any (Phase_ADRecon),         "AD Reconnaissance",
+    Commandlet has_any (Phase_NetworkRecon),    "Network Reconnaissance",
+    Commandlet has_any (Phase_CredHarvest),     "Credential Harvesting",
+    Commandlet has_any (Phase_LateralMovement), "Lateral Movement",
+    Commandlet has_any (Phase_Persistence),     "Persistence",
+    Commandlet has_any (Phase_DefenceEvasion),  "Defence Evasion",
+    Commandlet has_any (Phase_Exfil),           "Exfiltration / C2",
+    "Unknown"
+)
+| extend Severity = case(
+    AttackPhase in ("Credential Harvesting", "Lateral Movement", "Exfiltration / C2"), "High",
+    AttackPhase in ("Persistence", "Defence Evasion"),                                 "High",
+    AttackPhase == "AD Reconnaissance",                                                "Medium",
+    "Low"
+)
+| extend
+    Username    = tostring(split(InitiatingProcessAccountUpn, '@')[0]),
+    UPNSuffix   = tostring(split(InitiatingProcessAccountUpn, '@')[1]),
+    DvcHostname = tostring(split(DeviceName, '.')[0]),
+    DvcDomain   = tostring(strcat_array(array_slice(split(DeviceName, '.'), 1, -1), '.'))
+| project
+    Timestamp,
+    DeviceName,
+    DvcHostname,
+    DvcDomain,
+    Username,
+    UPNSuffix,
+    AttackPhase,
+    Severity,
+    Commandlet,
+    InitiatingProcessFileName,
+    InitiatingProcessFolderPath,
+    InitiatingProcessCommandLine,
+    LocalIP,
+    InitiatingProcessId
+| order by Severity asc, Timestamp desc
