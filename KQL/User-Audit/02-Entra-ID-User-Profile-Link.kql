@@ -1,5 +1,6 @@
-// Entra ID User Profile Link
-// Description: Generates a clickable URL for the user's Azure profile
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let User_UPN = "user@domain.com";
+SigninLogs
+| where ResultType == 0
+| where UserPrincipalName == User_UPN
+| take 1
+| project UserProfile = strcat("https://portal.azure.com/#blade/Microsoft_AAD_IAM/UserDetailsMenuBlade/Profile/userId/", UserId)
