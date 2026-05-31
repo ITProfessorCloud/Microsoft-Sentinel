@@ -1,5 +1,4 @@
-// Identity Record
-// Description: Pulls HR related context (job title, department, groups) from IdentityInfo table
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let UPN_ = "user@domain.com";
+IdentityInfo
+| where AccountUPN == UPN_
+| project AccountUPN, GivenName, Surname, GroupMembership, Department, JobTitle, IsAccountEnabled, UserType
