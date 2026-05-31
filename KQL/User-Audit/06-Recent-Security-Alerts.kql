@@ -1,0 +1,5 @@
+// Recent Security Alerts
+// Description: Checks SecurityAlert table for historical alerts associated with the user
+// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
+
+// TODO: Add KQL query here
