@@ -1,5 +1,7 @@
-// Top Applications Accessed
-// Description: Ranks user's most frequently accessed applications over the last 30 days
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let User_UPN = "user@domain.com";
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where UserPrincipalName == User_UPN
+| summarize AppAccessCount = count() by AppDisplayName
+| where isnotempty(AppDisplayName)
+| top 50 by AppAccessCount desc
