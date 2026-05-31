@@ -1,5 +1,71 @@
-// AMSI Bypass Attempts
-// Description: Detects attempts to bypass or disable AMSI (Antimalware Scan Interface) which is commonly used by attackers to evade detection
-// Blog: https://www.itprofessor.cloud/hunting-powershell-abuse-mde-kql/
-
-// TODO: Add KQL query here
+// ============================================================
+// Hunt: PowerShell AMSI Bypass Attempts
+// MITRE: T1562.001 | T1059.001
+// ============================================================
+let LookbackPeriod = 7d;
+let AMSIReflectionIndicators = dynamic([
+    "AmsiUtils", "amsiInitFailed", "amsiContext", "amsiSession",
+    "AmsiInitialize", "AmsiScanBuffer", "AmsiOpenSession",
+    "amsi.dll", "System.Management.Automation.AmsiUtils"
+]);
+let AMSIToolIndicators = dynamic([
+    "Invoke-AmsiBypass", "Bypass.AMSI", "FindAmsiFun",
+    "Disable-Amsi", "AmsiBypass", "unloadobfuscated", "unloadsilent"
+]);
+let ReflectionPatterns = dynamic([
+    "Assembly.GetType", "GetField(", "SetValue(",
+    "AllocHGlobal", "VirtualProtect", "WriteProcessMemory",
+    "Marshal.Copy", "GetDelegateForFunctionPointer"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(LookbackPeriod)
+| where FileName has_any ("powershell.exe", "pwsh.exe", "powershell_ise.exe")
+| where ProcessCommandLine has_any (AMSIReflectionIndicators)
+      or ProcessCommandLine has_any (AMSIToolIndicators)
+      or (ProcessCommandLine has_any (ReflectionPatterns)
+          and ProcessCommandLine has_any ("amsi", "Amsi", "AMSI"))
+| extend
+    UsesReflectionField  = ProcessCommandLine has_any ("GetField(", "SetValue("),
+    UsesMemoryPatch      = ProcessCommandLine has_any ("VirtualProtect", "WriteProcessMemory", "AllocHGlobal"),
+    UsesNamedTool        = ProcessCommandLine has_any (AMSIToolIndicators),
+    UsesAmsiUtils        = ProcessCommandLine has_any ("AmsiUtils", "amsiInitFailed"),
+    HasHiddenWindow      = (ProcessCommandLine contains "-w h"
+                         or ProcessCommandLine contains "-w hidden"
+                         or ProcessCommandLine contains "-windowstyle h"
+                         or ProcessCommandLine contains "-windowstyle hidden"),
+    HasNoProfile         = ProcessCommandLine has_any ("-nop", "-noprofile"),
+    HasEncodedCmd        = ProcessCommandLine has_any ("-enc", "-EncodedCommand"),
+    HasFollowOnDownload  = ProcessCommandLine has_any ("DownloadString", "Invoke-WebRequest", "iwr ", "irm "),
+    HasFollowOnIEX       = ProcessCommandLine has_any ("iex", "Invoke-Expression")
+| extend RiskScore =
+    toint(UsesAmsiUtils)        * 40 +
+    toint(UsesMemoryPatch)      * 35 +
+    toint(UsesReflectionField)  * 25 +
+    toint(UsesNamedTool)        * 30 +
+    toint(HasFollowOnDownload)  * 20 +
+    toint(HasFollowOnIEX)       * 20 +
+    toint(HasHiddenWindow)      * 10 +
+    toint(HasNoProfile)         * 10 +
+    toint(HasEncodedCmd)        * 15
+| extend BypassTechnique = case(
+    UsesMemoryPatch and UsesAmsiUtils,     "Memory Patch via Reflection (AmsiScanBuffer patch)",
+    UsesAmsiUtils and UsesReflectionField, "amsiInitFailed field flip via Reflection",
+    UsesMemoryPatch,                       "Direct Memory Patch (VirtualProtect/WriteProcessMemory)",
+    UsesNamedTool,                         "Known AMSI Bypass Tool",
+    "Unknown Technique"
+)
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    BypassTechnique,
+    RiskScore,
+    ProcessCommandLine,
+    UsesAmsiUtils, UsesReflectionField, UsesMemoryPatch, UsesNamedTool,
+    HasFollowOnDownload, HasFollowOnIEX,
+    HasHiddenWindow, HasNoProfile, HasEncodedCmd,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    SHA256,
+    ReportId
+| order by RiskScore desc, Timestamp desc
