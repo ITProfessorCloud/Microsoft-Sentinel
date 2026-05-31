@@ -1,0 +1,4 @@
+// Base64 Encoded PowerShell
+// Description: Detects classic first-stage loader patterns (e.g., -enc) and decodes the Base64 blob to search for malicious indicators like IEX or Net.WebClient.
+
+// TODO: Add KQL query here
