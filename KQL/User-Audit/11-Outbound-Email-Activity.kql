@@ -1,5 +1,5 @@
-// Outbound Email Activity
-// Description: Tracks outbound communication logs from EmailEvents
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let Sender_ = "user@domain.com";
+EmailEvents
+| where SenderFromAddress == Sender_ and EmailDirection == "Outbound"
+| project TimeGenerated, RecipientEmailAddress, Subject, ThreatTypes, DetectionMethods
+| sort by TimeGenerated desc
