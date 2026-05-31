@@ -1,4 +1,100 @@
-// PowerShell Download Cradles
-// Description: Provides comprehensive coverage for various download methods including Net.WebClient, Invoke-WebRequest, BITS, and HttpClient.
-
-// TODO: Add KQL query here
+// ============================================================
+// Hunt: PowerShell Download Cradles — Comprehensive Coverage
+// MITRE: T1059.001 | T1105 | T1218 | T1140
+// ============================================================
+let LookbackPeriod = 7d;
+let NetWebClientMethods = dynamic([
+    "Net.WebClient", "System.Net.WebClient",
+    "DownloadString", "DownloadFile", "DownloadData", "OpenRead"
+]);
+let NativeCmdlets = dynamic([
+    "Invoke-WebRequest", "iwr ", "Invoke-RestMethod", "irm ",
+    "Invoke-Expression", "Start-BitsTransfer"
+]);
+let HttpClientMethods = dynamic([
+    "System.Net.Http.HttpClient", "HttpClient",
+    "GetStringAsync", "GetStreamAsync", "GetByteArrayAsync"
+]);
+let ReflectionLoaders = dynamic([
+    "Reflection.Assembly", "Assembly.Load", "Assembly.LoadFrom",
+    "Assembly.LoadFile", "[System.Reflection.Assembly]",
+    "[scriptblock]::Create"
+]);
+let ProxyAwareCradles = dynamic([
+    "Net.WebProxy", "WebProxy", "UseDefaultCredentials",
+    "DefaultWebProxy"
+]);
+let ExecutionCradles = dynamic([
+    "| iex", "|iex", "| IEX", "|IEX",
+    "; iex", ";iex",
+    "iex(", "iex (", "Invoke-Expression",
+    "& ([scriptblock]", ".Invoke("
+]);
+DeviceProcessEvents
+| where Timestamp > ago(LookbackPeriod)
+| where FileName has_any ("powershell.exe", "pwsh.exe", "powershell_ise.exe")
+| where ProcessCommandLine has_any (NetWebClientMethods)
+      or ProcessCommandLine has_any (NativeCmdlets)
+      or ProcessCommandLine has_any (HttpClientMethods)
+      or ProcessCommandLine has_any (ReflectionLoaders)
+      or ProcessCommandLine has_any (ProxyAwareCradles)
+      or (ProcessCommandLine has_any ("http://", "https://")
+          and ProcessCommandLine has_any (ExecutionCradles))
+| extend
+    UsesWebClient        = ProcessCommandLine has_any (NetWebClientMethods),
+    UsesDownloadString   = ProcessCommandLine has "DownloadString",
+    UsesDownloadFile     = ProcessCommandLine has "DownloadFile",
+    UsesIWR              = ProcessCommandLine has_any ("Invoke-WebRequest", "iwr "),
+    UsesIRM              = ProcessCommandLine has_any ("Invoke-RestMethod", "irm "),
+    UsesBITS             = ProcessCommandLine has "Start-BitsTransfer",
+    UsesHttpClient       = ProcessCommandLine has_any ("HttpClient", "System.Net.Http"),
+    UsesReflection       = ProcessCommandLine has_any (ReflectionLoaders),
+    UsesProxyAware       = ProcessCommandLine has_any (ProxyAwareCradles),
+    HasDirectIEX         = ProcessCommandLine has_any (ExecutionCradles),
+    HasScriptBlockCreate = ProcessCommandLine has_any ("[scriptblock]::Create", ".Invoke("),
+    HasHiddenWindow      = (ProcessCommandLine contains "-w h"
+                         or ProcessCommandLine contains "-w hidden"
+                         or ProcessCommandLine contains "-windowstyle h"
+                         or ProcessCommandLine contains "-windowstyle hidden"),
+    HasNoProfile         = ProcessCommandLine has_any ("-nop", "-noprofile"),
+    HasBypass            = ProcessCommandLine has_any ("bypass", "-ep bypass"),
+    HasEncodedCmd        = ProcessCommandLine has_any ("-enc", "-EncodedCommand"),
+    TargetURI            = extract(@"(https?://[^\s""';\)]+)", 0, ProcessCommandLine),
+    TargetDomain         = extract(@"https?://([^/\s""';\)]+)", 1, ProcessCommandLine),
+    SuspiciousParent     = InitiatingProcessFileName has_any (
+        "winword.exe","excel.exe","powerpnt.exe","outlook.exe","mshta.exe",
+        "wscript.exe","cscript.exe","cmd.exe","msiexec.exe","regsvr32.exe",
+        "rundll32.exe","schtasks.exe","at.exe"
+    )
+| extend RiskScore =
+    toint(HasDirectIEX)         * 35 +
+    toint(UsesDownloadString)   * 20 +
+    toint(UsesReflection)       * 30 +
+    toint(HasScriptBlockCreate) * 20 +
+    toint(HasHiddenWindow)      * 15 +
+    toint(HasNoProfile)         * 10 +
+    toint(HasBypass)            * 10 +
+    toint(HasEncodedCmd)        * 20 +
+    toint(UsesProxyAware)       * 15 +
+    toint(SuspiciousParent)     * 25 +
+    toint(UsesBITS)             * 15 +
+    case(strlen(ProcessCommandLine) > 500, 10, 0)
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    ProcessCommandLine,
+    TargetURI,
+    TargetDomain,
+    RiskScore,
+    UsesWebClient, UsesDownloadString, UsesDownloadFile,
+    UsesIWR, UsesIRM, UsesBITS, UsesHttpClient,
+    UsesReflection, UsesProxyAware,
+    HasDirectIEX, HasScriptBlockCreate,
+    HasHiddenWindow, HasNoProfile, HasBypass, HasEncodedCmd,
+    SuspiciousParent,
+    SHA256,
+    ReportId
+| order by RiskScore desc, Timestamp desc
