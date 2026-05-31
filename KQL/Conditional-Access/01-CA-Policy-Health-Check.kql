@@ -1,5 +1,223 @@
+// =================================================================
 // Conditional Access Policy Health Check
-// Description: Grades every CA policy by real sign-in data across all three sign-in tables. Shows true MFA coverage, block rates, and report-only disruption.
-// Blog: https://www.itprofessor.cloud/conditional-access-policy-health-check-kql/
-
-// TODO: Add KQL query here
+// Author: itprofessor.cloud
+//
+// Grades every CA policy by activity
+// Behavior-only classification
+// Covers Interactive, Non-Interactive, Service Principal, and Report-Only traffic.
+// =================================================================
+let timeRange = 14d;
+// "0" = Allowed. "53000-53002" = Device/App compliance blocks. "53003" = Hard CA block.
+// "50074/50076/50079/500121" = MFA interruptions, the policy fired, it did its job.
+let CAResultTypes = dynamic([
+    "0", "53000", "53001", "53002", "53003",
+    "50074", "50076", "50079", "500121"
+]);
+// 1. Pull from all three sign-in tables
+// CA evaluates humans (Interactive), background apps (Non-Interactive), and
+// workload identities (Service Principals), so we need all three.
+let AllSignins =
+    union isfuzzy=true
+        (SigninLogs | extend SignInType = "Interactive"),
+        (AADNonInteractiveUserSignInLogs | extend SignInType = "Non-Interactive"),
+        (AADServicePrincipalSignInLogs | extend SignInType = "Service-Principal")
+    | where TimeGenerated > ago(timeRange)
+    | where ResultType in (CAResultTypes)
+    // The CA policies JSON lives in different columns depending on workspace age and DCR config.
+    // This coalesce handles all three variants so the query doesn't silently return nothing.
+    // If you're getting 0 rows, check whether your workspace stores this as _string or _dynamic.
+    // Also worth knowing: malformed JSON in this column returns null from todynamic() with no error.
+    // If data looks missing, run a raw parse check on the source table before blaming the query :D.
+    | extend ConditionalAccessPolicies = coalesce(
+        todynamic(column_ifexists("ConditionalAccessPolicies_string", "")),
+        column_ifexists("ConditionalAccessPolicies_dynamic", dynamic(null)),
+        column_ifexists("ConditionalAccessPolicies", dynamic(null))
+      )
+    | where isnotempty(ConditionalAccessPolicies);
+// 2. Expand - one row per policy per sign-in
+// mv-expand blows up the CA array so each evaluated policy gets its own row.
+// We can pull the actual controls that fired - this is how we classify intent later.
+AllSignins
+| mv-expand CAP = ConditionalAccessPolicies
+| extend
+    PolicyName   = tostring(CAP.displayName),
+    Result       = tostring(CAP.result),
+    GrantCtrls   = tostring(CAP.enforcedGrantControls),
+    SessionCtrls = tostring(CAP.enforcedSessionControls)
+| where isnotempty(PolicyName)
+| where Result in (
+    "success", "failure", "notApplied",
+    "reportOnlySuccess", "reportOnlyFailure", "reportOnlyNotApplied",
+    "notEnabled"
+  )
+// 3. Aggregate per policy
+// dcountif(CorrelationId) not countif, mv-expand creates multiple rows per sign-in.
+// countif would overcount and blow your percentages past 100%. Don't use it here.
+| summarize
+    // Int_ = humans at a keyboard
+    Int_Granted    = dcountif(CorrelationId, SignInType == "Interactive" and Result == "success"),
+    Int_Blocked    = dcountif(CorrelationId, SignInType == "Interactive" and Result == "failure"),
+    Int_NotApplied = dcountif(CorrelationId, SignInType == "Interactive" and Result == "notApplied"),
+    // NI_ = background token refreshes - high volume, low signal, keep separate
+    NI_Granted     = dcountif(CorrelationId, SignInType == "Non-Interactive" and Result == "success"),
+    NI_Blocked     = dcountif(CorrelationId, SignInType == "Non-Interactive" and Result == "failure"),
+    NI_NotApplied  = dcountif(CorrelationId, SignInType == "Non-Interactive" and Result == "notApplied"),
+    // SPN_ = workload identities - a blocked SPN is an app problem, not a user problem
+    SPN_Granted    = dcountif(CorrelationId, SignInType == "Service-Principal" and Result == "success"),
+    SPN_Blocked    = dcountif(CorrelationId, SignInType == "Service-Principal" and Result == "failure"),
+    SPN_NotApplied = dcountif(CorrelationId, SignInType == "Service-Principal" and Result == "notApplied"),
+    // RO_ = Report-Only mode
+    // RO_Pass = would have passed. RO_Fail = WOULD HAVE BLOCKED. RO_Skip = didn't match at all.
+    // RO_Fail is the one that matters - it tells you how many users break if you enable this today.
+    RO_Pass        = dcountif(CorrelationId, Result == "reportOnlySuccess"),
+    RO_Fail        = dcountif(CorrelationId, Result == "reportOnlyFailure"),
+    RO_Skip        = dcountif(CorrelationId, Result == "reportOnlyNotApplied"),
+    // Internal signals for classifying what the policy actually does
+    Disabled_Count  = dcountif(CorrelationId, Result == "notEnabled"),
+    BlockCtrlSeen   = dcountif(CorrelationId, GrantCtrls has "block"),
+    SessionCtrlSeen = dcountif(CorrelationId, isnotempty(SessionCtrls) and SessionCtrls != "[]"),
+    GrantCtrlSeen   = dcountif(CorrelationId, isnotempty(GrantCtrls) and not(GrantCtrls has "block") and GrantCtrls != "[]"),
+    // notEnabled rows are excluded, disabled policies should show Total = 0, not inflate the count
+    Total          = dcountif(CorrelationId, Result != "notEnabled")
+    by PolicyName
+// Disabled policies have Total = 0 and get filtered out without the second condition.
+// Keep them - knowing what's disabled is part of the health picture.
+| where Total > 10 or Disabled_Count > 0
+// 4. Roll up the totals
+| extend
+    AllGranted    = Int_Granted + NI_Granted + SPN_Granted,
+    AllBlocked    = Int_Blocked + NI_Blocked + SPN_Blocked,
+    AllNotApplied = Int_NotApplied + NI_NotApplied + SPN_NotApplied,
+    // Enforced = policy fired and produced an outcome (pass or block)
+    Enforced      = Int_Granted + NI_Granted + SPN_Granted + Int_Blocked + NI_Blocked + SPN_Blocked,
+    // InScope = policy conditions matched, regardless of what happened next
+    // RO_Skip is excluded - those sign-ins didn't match even in simulation mode
+    // For pure Report-Only policies, lean on RO_DisruptPct not ScopePct
+    InScope       = Int_Granted + NI_Granted + SPN_Granted + Int_Blocked + NI_Blocked + SPN_Blocked + RO_Pass + RO_Fail,
+    RO_Total      = RO_Pass + RO_Fail + RO_Skip
+// 5. Calculate the three metrics that matter
+| extend
+    // ScopePct: what % of total sign-ins does this policy actually touch?
+    // Low ScopePct on a Grant policy = problem. Low ScopePct on a Block policy = good.
+    ScopePct      = iff(Total > 0, round(todouble(InScope) / todouble(Total) * 100, 1), 0.0),
+    // BlockRate: when the policy matches, how often does it block?
+    // Denominator is Enforced not Total - targeted block policies shouldn't get punished for low volume
+    BlockRate     = iff(Enforced > 0, round(todouble(AllBlocked) / todouble(Enforced) * 100, 1), 0.0),
+    // RO_DisruptPct: the number that tells you whether it's safe to flip this policy on.
+    // 30%+ means roughly 1 in 3 affected users would get locked out. Don't enable that on a Friday ^^
+    RO_DisruptPct = iff((RO_Pass + RO_Fail) > 0, round(todouble(RO_Fail) / todouble(RO_Pass + RO_Fail) * 100, 1), 0.0)
+// 6. Classify by behavior
+// We read what the policy actually enforced from the JSON. Works (well, it should) in any language,
+// any naming convention, any tenant. A policy in staged rollout can have both
+// Enforced > 0 and RO_Total > 0, it correctly classifies as live and RO columns stay visible.
+| extend
+    HasBlockCtrl    = BlockCtrlSeen > 0,
+    HasGrantCtrl    = GrantCtrlSeen > 0,
+    HasSessionCtrl  = SessionCtrlSeen > 0,
+    // IsRareCondition catches policies that fire rarely by design, risk-based policies,
+    // small groups, uncommon OS. A risk policy with 0 hits isn't broken, the environment is clean.
+    IsRareCondition = (ScopePct < 5 and AllNotApplied > 100)
+| extend PolicyType = case(
+    Disabled_Count > 0 and Total == 0,    "⚪ Disabled",
+    Enforced == 0 and RO_Total > 0,       "📊 Report-Only",
+    HasBlockCtrl,                         "🚫 Block",
+    HasGrantCtrl and HasSessionCtrl,      "✅ Grant + ⏱️ Session",
+    HasSessionCtrl and not(HasGrantCtrl), "⏱️ Session Control",
+                                          "✅ Grant/Require"
+  )
+// 7. Grade - logic inverts depending on policy type
+// Grant/Session: high scope = good. Block: low hit rate = good. Report-Only: low disruption = safe.
+// IsRareCondition must be checked before ScopePct >= 5 - it requires ScopePct < 5,
+// so putting ScopePct >= 5 first makes IsRareCondition permanently unreachable.
+| extend Grade = case(
+    PolicyType == "⚪ Disabled",
+        "⚪ Disabled - evaluate if still needed",
+    PolicyType in ("✅ Grant/Require", "✅ Grant + ⏱️ Session", "⏱️ Session Control")
+        and ScopePct >= 80 and BlockRate < 50,
+        "🟢 A - Strong coverage",
+    // Wide reach but users are getting blocked - the scope isn't the issue, the controls are
+    PolicyType in ("✅ Grant/Require", "✅ Grant + ⏱️ Session", "⏱️ Session Control")
+        and ScopePct >= 50 and BlockRate >= 50,
+        "🟠 C - Broad scope but high block rate - users failing controls",
+    PolicyType in ("✅ Grant/Require", "✅ Grant + ⏱️ Session", "⏱️ Session Control")
+        and ScopePct >= 50,
+        "🟡 B - Partial scope - review exclusions",
+    PolicyType in ("✅ Grant/Require", "✅ Grant + ⏱️ Session", "⏱️ Session Control")
+        and IsRareCondition,
+        "🔵 Rare Condition (Risk-based, targeted group, or rare OS)",
+    PolicyType in ("✅ Grant/Require", "✅ Grant + ⏱️ Session", "⏱️ Session Control")
+        and ScopePct >= 5,
+        "🟠 C - Narrow scope - verify targeting",
+    // ScopePct between 0-5 but doesn't qualify as IsRareCondition - small group or misconfigured
+    PolicyType in ("✅ Grant/Require", "✅ Grant + ⏱️ Session", "⏱️ Session Control")
+        and ScopePct > 0,
+        "🔴 D - Low scope (small group or possible misconfiguration)",
+    // 0 hits - could be a healthy risk policy or a completely broken config. Investigate.
+    PolicyType in ("✅ Grant/Require", "✅ Grant + ⏱️ Session", "⏱️ Session Control"),
+        "👻 0 Hits (Broken configuration OR no risk events triggered)",
+    PolicyType == "🚫 Block" and InScope == 0,
+        "🟢 A - Clean environment (no violations)",
+    PolicyType == "🚫 Block" and BlockRate < 20,
+        "🟢 A - In scope but rarely blocks",
+    PolicyType == "🚫 Block" and BlockRate < 50,
+        "🟡 B - Moderate blocking",
+    PolicyType == "🚫 Block" and BlockRate < 80,
+        "🟠 C - High block rate - investigate",
+    PolicyType == "🚫 Block",
+        "🔴 D - Blocking >80% of in-scope",
+    // Report-Only graded on disruption risk only - ScopePct is misleading here
+    PolicyType == "📊 Report-Only" and RO_DisruptPct >= 30,
+        "🔵⚠️ High disruption (>30% would be blocked)",
+    PolicyType == "📊 Report-Only" and RO_DisruptPct >= 10,
+        "🔵 Moderate disruption - review before enabling",
+    PolicyType == "📊 Report-Only" and ScopePct >= 50,
+        "🔵 Broad scope, low disruption - consider enabling",
+    PolicyType == "📊 Report-Only" and ScopePct >= 10,
+        "🔵 Moderate scope",
+    PolicyType == "📊 Report-Only",
+        "🔵 Low projected impact",
+    "⚪ Unclassified"
+  )
+// 8. Surface the things worth acting on
+// NI_Pct and SPN_Pct are split intentionally - "background token refreshes"
+// and "service principal traffic" are different problems requiring different responses.
+| extend
+    NI_Pct  = iff(Total > 0, todouble(NI_Granted + NI_Blocked + NI_NotApplied) / todouble(Total) * 100, 0.0),
+    SPN_Pct = iff(Total > 0, todouble(SPN_Granted + SPN_Blocked + SPN_NotApplied) / todouble(Total) * 100, 0.0)
+| extend Note = case(
+    PolicyType == "⚪ Disabled", "",
+    IsRareCondition and ScopePct == 0 and PolicyType !in ("🚫 Block", "📊 Report-Only"),
+        "ℹ️ 0 hits - could be a healthy risk-based policy or a broken config. Open the portal and check.",
+    IsRareCondition and ScopePct > 0 and PolicyType !in ("🚫 Block", "📊 Report-Only"),
+        "ℹ️ Low hits - probably scoped to a small group, rare OS, or specific risk conditions.",
+    PolicyType in ("✅ Grant/Require", "✅ Grant + ⏱️ Session", "⏱️ Session Control")
+        and BlockRate > 50 and Enforced > 50,
+        "⚠️ Over half of in-scope sign-ins are getting blocked - users are struggling with these controls.",
+    PolicyType == "🚫 Block" and BlockRate >= 80 and Enforced > 50,
+        "⚠️ Blocking >80% of in-scope traffic - either the scope is too wide or something is actively wrong.",
+    PolicyType == "📊 Report-Only" and RO_DisruptPct >= 30,
+        strcat("⚠️ Enabling this would break ~", tostring(round(RO_DisruptPct, 0)), "% of affected users. Don't touch it until you know why."),
+    SPN_Pct > 90,
+        "ℹ️ >90% service principal traffic - these metrics reflect workload identities, not humans.",
+    NI_Pct > 90,
+        "ℹ️ >90% non-interactive traffic - you're mostly looking at background token refreshes here, not real logons.",
+    (SPN_Granted + SPN_Blocked) > 0,
+        strcat("ℹ️ ", tostring(SPN_Granted + SPN_Blocked), " service principal sign-ins evaluated against this policy."),
+    ""
+  )
+// 9. Sort and output
+| extend _SortKey = case(
+    PolicyType == "⚪ Disabled", 999.0,
+    PolicyType == "🚫 Block", -BlockRate,
+    PolicyType == "📊 Report-Only", -RO_DisruptPct,
+    ScopePct
+  )
+| project
+    PolicyName, PolicyType, Grade, ScopePct, BlockRate,
+    Int_Granted, Int_Blocked, Int_NotApplied,
+    NI_Granted, NI_Blocked, NI_NotApplied,
+    SPN_Granted, SPN_Blocked,
+    RO_Pass, RO_Fail,
+    Total, Note, _SortKey
+| sort by PolicyType asc, _SortKey asc
+| project-away _SortKey
