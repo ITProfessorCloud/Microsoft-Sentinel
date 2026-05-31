@@ -1,0 +1,4 @@
+// High Special Character Ratio Obfuscation
+// Description: Targets obfuscation tools like Invoke-Obfuscation by measuring the ratio of special characters (backticks, carets, dollar signs) to alphanumeric characters.
+
+// TODO: Add KQL query here
