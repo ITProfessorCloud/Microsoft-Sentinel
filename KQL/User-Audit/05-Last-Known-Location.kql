@@ -1,0 +1,5 @@
+// Last Known Location
+// Description: Uses arg_max to identify most recent sign in details for a user
+// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
+
+// TODO: Add KQL query here
