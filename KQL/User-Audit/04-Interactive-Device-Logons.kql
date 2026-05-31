@@ -1,5 +1,8 @@
-// Interactive Device Logons
-// Description: Filters DeviceLogonEvents for interactive keyboard or RDP sessions
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let DeviceName_ = "<Device_Name>"; 
+DeviceLogonEvents
+| where DeviceName == DeviceName_
+| where ActionType == "LogonSuccess" 
+| where LogonType == "Interactive"
+| where InitiatingProcessCommandLine has "lsass.exe"
+| project TimeGenerated, DeviceName, AccountName, LogonType, InitiatingProcessCommandLine
+| sort by TimeGenerated desc
