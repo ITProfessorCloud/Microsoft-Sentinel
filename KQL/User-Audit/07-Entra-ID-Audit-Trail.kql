@@ -1,5 +1,16 @@
-// Entra ID Audit Trail
-// Description: Examines AuditLogs for administrative changes like password resets or user creation
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let UserPrincipalName_ = "user@domain.com";
+AuditLogs
+| extend InitiatorUPN = tostring(InitiatedBy.user.userPrincipalName)
+| where isnotempty(InitiatorUPN) and InitiatorUPN has UserPrincipalName_
+| mv-expand TargetResources
+| extend TargetUPN = tostring(TargetResources.userPrincipalName),
+         ModifiedProperties = TargetResources.modifiedProperties
+| project TimeGenerated,
+          InitiatorUPN,
+          OperationName,
+          ActivityDisplayName,
+          TargetUPN,
+          Result,
+          ResultReason,
+          ModifiedProperties
+| sort by TimeGenerated desc
