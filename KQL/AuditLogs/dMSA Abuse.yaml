@@ -1,7 +1,0 @@
-//Detect delegation of Managed Service Accounts that link to high-privilege accounts 
-SecurityEvent
-| where EventID == 5136
-| where EventData has "<Data Name=\"ObjectClass\">msDS-DelegatedManagedServiceAccount</Data>"
-| where EventData has "<Data Name=\"AttributeLDAPDisplayName\">msDS-ManagedAccountPrecededByLink</Data>"
-| extend AttributeValue = extract(@"<Data Name=""AttributeValue"">([^<]+)<", 1, EventData)
-| extend IsHighRisk = iff(tolower(AttributeValue) has "admin", true, false)
