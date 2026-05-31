@@ -1,4 +1,71 @@
-// PowerShell Weakening Windows Defender
-// Description: Looks for command-line attempts to disable Defender features (real-time monitoring, script scanning) or add exclusions to staging paths.
-
-// TODO: Add KQL query here
+// ============================================================
+// Hunt: PowerShell Weakening Windows Defender
+// MITRE: T1562.001 (Impair Defenses: Disable or Modify Tools)
+// ============================================================
+let LookbackPeriod = 7d;
+let WeakenCmdlets = dynamic([
+    "Add-MpPreference", "Set-MpPreference",
+    "MSFT_MpPreference", "Set-CimInstance", "Invoke-CimMethod", "Set-WmiInstance"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(LookbackPeriod)
+| where FileName has_any ("powershell.exe", "pwsh.exe", "powershell_ise.exe", "cmd.exe")
+| where ProcessCommandLine has_any (WeakenCmdlets)
+| extend
+    IsExclusionPath    = ProcessCommandLine has "-ExclusionPath",
+    IsExclusionExt     = ProcessCommandLine has "-ExclusionExtension",
+    IsExclusionProcess = ProcessCommandLine has "-ExclusionProcess",
+    IsExclusionIP      = ProcessCommandLine has "-ExclusionIpAddress",
+    IsDisableRealtime  = ProcessCommandLine has "-DisableRealtimeMonitoring",
+    IsDisableAV        = ProcessCommandLine has_any ("-DisableAntiVirus", "-DisableAntiSpyware"),
+    IsDisableScripts   = ProcessCommandLine has "-DisableScriptScanning",
+    IsDisableBehavior  = ProcessCommandLine has "-DisableBehaviorMonitoring",
+    IsDisableCloud     = ProcessCommandLine has_any ("-MAPSReporting", "-SubmitSamplesConsent"),
+    IsDisableNetwork   = ProcessCommandLine has "-DisableNetworkProtection",
+    IsDisableCFA       = ProcessCommandLine has "-EnableControlledFolderAccess",
+    IsWMIBased         = ProcessCommandLine has_any ("MSFT_MpPreference", "Set-CimInstance", "Invoke-CimMethod", "Set-WmiInstance"),
+    TargetsStagingPath = ProcessCommandLine has_any (
+        "ProgramData", "AppData\\Roaming", "AppData\\Local",
+        "Users\\Public", "Windows\\Temp", "$env:temp", "%temp%", "%appdata%"
+    ),
+    HasErrorSuppression = ProcessCommandLine has_any (
+        "try", "catch", "-ErrorAction SilentlyContinue",
+        "-EA SilentlyContinue", "2>nul", "2>&1", "-ErrorAction Ignore"
+    ),
+    ExclusionValue = extract(@"(?i)-Exclusion(?:Path|Extension|Process|IpAddress)\s+([^\s;|&]+)", 1, ProcessCommandLine),
+    SuspiciousParent = InitiatingProcessFileName has_any (
+        "winword.exe","excel.exe","powerpnt.exe","mshta.exe",
+        "wscript.exe","cscript.exe","cmd.exe","rundll32.exe","regsvr32.exe"
+    )
+| extend RiskScore =
+    toint(IsDisableRealtime)   * 45 +
+    toint(IsDisableAV)         * 45 +
+    toint(IsDisableScripts)    * 35 +
+    toint(IsDisableBehavior)   * 35 +
+    toint(IsDisableCloud)      * 25 +
+    toint(IsDisableNetwork)    * 25 +
+    toint(IsDisableCFA)        * 20 +
+    toint(IsExclusionPath)     * 30 +
+    toint(IsExclusionExt)      * 25 +
+    toint(IsExclusionProcess)  * 25 +
+    toint(IsWMIBased)          * 20 +
+    toint(TargetsStagingPath)  * 20 +
+    toint(HasErrorSuppression) * 15 +
+    toint(SuspiciousParent)    * 30
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    ProcessCommandLine,
+    ExclusionValue,
+    RiskScore,
+    IsExclusionPath, IsExclusionExt, IsExclusionProcess, IsExclusionIP,
+    IsDisableRealtime, IsDisableAV, IsDisableScripts,
+    IsDisableBehavior, IsDisableCloud, IsDisableNetwork, IsDisableCFA,
+    TargetsStagingPath, IsWMIBased, HasErrorSuppression,
+    SuspiciousParent,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    SHA256,
+    ReportId
+| order by RiskScore desc, Timestamp desc
