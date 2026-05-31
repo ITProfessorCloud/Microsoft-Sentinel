@@ -1,4 +1,66 @@
-// Suspicious Long Command Lines
-// Description: Identifies fileless execution patterns where attackers hide payloads in long, obfuscated command strings.
-
-// TODO: Add KQL query here
+// ============================================================
+// Hunt: Suspicious Long PowerShell Command Lines
+// MITRE: T1059.001 | T1027 | T1140
+// Long commands often contain encoded payloads, LOTL chains, or
+// concatenated script fragments designed to evade simple IOC matching
+// ============================================================
+let LookbackPeriod = 7d;
+let MinCommandLength = 500;
+DeviceProcessEvents
+| where Timestamp > ago(LookbackPeriod)
+| where FileName has_any ("powershell.exe", "pwsh.exe", "powershell_ise.exe")
+// Whitelist MDE's own legitimate long commands
+| where not(AccountName =~ "system" and InitiatingProcessFileName =~ "sensecm.exe")
+| where not(ProcessCommandLine has @"Windows Defender Advanced Threat Protection\SenseCM")
+| extend CmdLen = strlen(ProcessCommandLine)
+| where CmdLen >= MinCommandLength
+| extend
+    HasBase64Blob    = ProcessCommandLine matches regex @"[A-Za-z0-9+/]{100,}={0,2}",
+    HasEncodedCmd    = ProcessCommandLine has_any ("-enc", "-EncodedCommand", "-ec "),
+    HasDirectIEX     = ProcessCommandLine has_any ("| iex", "|iex", "| IEX", "|IEX", "iex(", "iex (", "Invoke-Expression"),
+    HasDownloadCradle= ProcessCommandLine has_any ("DownloadString", "DownloadFile", "Invoke-WebRequest", "Net.WebClient", "iwr ", "irm "),
+    HasReflectionLoad= ProcessCommandLine has_any ("Assembly.Load", "Reflection.Assembly", "LoadFrom", "LoadFile"),
+    HasAMSIBypass    = ProcessCommandLine has_any ("AmsiUtils", "amsiInitFailed", "amsiContext", "amsiSession", "AmsiInitialize"),
+    HasCredTheft     = ProcessCommandLine has_any ("Invoke-Mimikatz", "sekurlsa", "lsadump", "ConvertFrom-SecureString", "Get-Credential"),
+    HasHiddenWindow  = (ProcessCommandLine contains "-w h"
+                     or ProcessCommandLine contains "-w hidden"
+                     or ProcessCommandLine contains "-windowstyle h"
+                     or ProcessCommandLine contains "-windowstyle hidden"),
+    HasBypass        = ProcessCommandLine has_any ("bypass", "-nop", "-noprofile"),
+    HasCharCodeObf   = ProcessCommandLine matches regex @"\[char\]\s*\d{2,3}",
+    HasStringConcat  = ProcessCommandLine matches regex @"'[^']{1,5}'\s*\+\s*'[^']{1,5}'",
+    LengthTier       = case(
+        CmdLen > 2000, "Critical",
+        CmdLen > 1000, "High",
+        CmdLen > 500,  "Medium",
+        "Low"
+    )
+| extend RiskScore =
+    toint(HasBase64Blob)      * 20 +
+    toint(HasEncodedCmd)      * 20 +
+    toint(HasDirectIEX)       * 25 +
+    toint(HasDownloadCradle)  * 20 +
+    toint(HasReflectionLoad)  * 25 +
+    toint(HasAMSIBypass)      * 35 +
+    toint(HasCredTheft)       * 35 +
+    toint(HasHiddenWindow)    * 10 +
+    toint(HasBypass)          * 10 +
+    toint(HasCharCodeObf)     * 15 +
+    toint(HasStringConcat)    * 15 +
+    case(CmdLen > 2000, 25, CmdLen > 1000, 15, 5)
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    CmdLen,
+    LengthTier,
+    RiskScore,
+    ProcessCommandLine,
+    HasBase64Blob, HasEncodedCmd, HasDirectIEX, HasDownloadCradle,
+    HasReflectionLoad, HasAMSIBypass, HasCredTheft,
+    HasHiddenWindow, HasBypass, HasCharCodeObf, HasStringConcat,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    SHA256,
+    ReportId
+| order by RiskScore desc, CmdLen desc, Timestamp desc
