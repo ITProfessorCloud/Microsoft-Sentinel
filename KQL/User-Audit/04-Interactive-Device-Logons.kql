@@ -1,0 +1,5 @@
+// Interactive Device Logons
+// Description: Filters DeviceLogonEvents for interactive keyboard or RDP sessions
+// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
+
+// TODO: Add KQL query here
