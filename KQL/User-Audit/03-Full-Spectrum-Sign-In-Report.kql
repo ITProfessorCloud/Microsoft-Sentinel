@@ -1,5 +1,24 @@
-// Full Spectrum Sign In Report
-// Description: Comprehensive overview of cloud sign in activity including device, location, and status
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let UserPrincipalName_ = "user@domain.com"; 
+SigninLogs 
+| where UserPrincipalName has UserPrincipalName_
+| extend City = tostring(LocationDetails.city),
+         State = tostring(LocationDetails.state),
+         CountryOrRegion = tostring(LocationDetails.countryOrRegion),
+         DeviceDisplayName = tostring(DeviceDetail.displayName),
+         DeviceOperatingSystem = tostring(DeviceDetail.operatingSystem),
+         StatusFailureReason = tostring(Status.failureReason)
+| project TimeGenerated, 
+          OperationName, 
+          UserDisplayName, 
+          IPAddress, 
+          UserType, 
+          AppDisplayName, 
+          ClientAppUsed, 
+          Location, 
+          DeviceDisplayName, 
+          DeviceOperatingSystem, 
+          City, 
+          State,
+          CountryOrRegion,
+          StatusFailureReason
+| sort by TimeGenerated desc
