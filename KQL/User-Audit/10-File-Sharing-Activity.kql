@@ -1,5 +1,8 @@
-// File Sharing Activity
-// Description: Tracks file sharing links created and sharing operations
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let UserPrincipalName_ = "user@domain.com"; 
+OfficeActivity
+| where Operation in ("SecureLinkCreated", "AddedToSecureLink", "SharingLinkUpdated", "SharingLinkCreated", "AnonymousLinkCreated") 
+| where UserId has UserPrincipalName_ 
+| summarize GuestShares = count(), 
+           SharedLinks = make_set(OfficeObjectId), 
+            SharedToUsers = make_set(TargetUserOrGroupName) by bin(TimeGenerated, 1d), Sharer = UserId
+| sort by TimeGenerated desc
