@@ -1,5 +1,9 @@
-// Recent Security Alerts
-// Description: Checks SecurityAlert table for historical alerts associated with the user
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let User_UPN = "user@domain.com";
+SecurityAlert
+| where TimeGenerated > ago(30d)
+| mv-expand todynamic(Entities)
+| extend EntityName = tostring(Entities.DisplayName)
+| where isnotempty(EntityName)
+| where Entities contains User_UPN
+| project TimeGenerated, AlertName, Description, ProviderName, ConfidenceLevel, EntityName
+| sort by TimeGenerated desc
