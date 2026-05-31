@@ -1,0 +1,11 @@
+// AuditLogs Activities by User
+// Description: Tracks all audit log activities for a specific user account
+
+let AccountUPN = "username@domain.com";
+let SearchWindow = 30d;
+AuditLogs
+| where TimeGenerated > ago(SearchWindow)
+| extend InitiatingUser = parse_json(InitiatedBy.user)
+| extend InitiatingUPN = tostring(InitiatingUser.userPrincipalName)
+| where InitiatingUPN == AccountUPN
+| project TimeGenerated, InitiatingUPN, OperationName, ResultDescription, ActivityDisplayName, Resource, Result
