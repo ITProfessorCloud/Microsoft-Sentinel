@@ -1,12 +1,11 @@
-## 🎉 Fun Folder 🎉
+# Fun Queries
 
-Welcome to the **Fun Folder**! 🎈 This folder is all about having some fun with KQL (Kusto Query Language)! Not everything in life is about work — sometimes we need to take a break, get creative, and add a bit of humor to the mix. 😄
+Experimental KQL queries for creative data exploration and visualization.
 
-In this folder, you'll find playful KQL queries like:
-- Counting alerts with quirky **stress levels** 🚨☕
-- Creating fun **ASCII art** 🎨
-- And much more...
+## What's Here
 
-KQL doesn't always have to be serious — sometimes it's fun to experiment and bring a smile to your face while exploring data. 😎 So go ahead, explore, tweak, and create your own fun queries! 🎉✨
+**01-PacMan-Board.kql**: Generates ASCII art PacMan board using KQL render functions.
 
-Remember, work hard, but don't forget to have fun along the way! 💻🌟
+**02-Security-Alerts-Stress-Levels.kql**: Categorizes alert counts with stress level indicators.
+
+**03-User-Password-Reset-Behavior.kql**: Tracks password reset patterns and user behavior anomalies.
