@@ -1,0 +1,4 @@
+// Suspicious PowerShell Cmdlets
+// Description: Uses DeviceEvents with ActionType == PowerShellCommand to catch suspicious cmdlet execution mapping to specific attack phases like AD Recon, Credential Harvesting, and Lateral Movement.
+
+// TODO: Add KQL query here
