@@ -1,0 +1,4 @@
+// PowerShell Download Cradles
+// Description: Provides comprehensive coverage for various download methods including Net.WebClient, Invoke-WebRequest, BITS, and HttpClient.
+
+// TODO: Add KQL query here
