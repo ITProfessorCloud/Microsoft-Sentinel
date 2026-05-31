@@ -1,5 +1,5 @@
-// File Access and Downloads
-// Description: Tracks OfficeActivity for file operations and downloads
-// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
-
-// TODO: Add KQL query here
+let UserPrincipalName_ = "user@domain.com"; 
+OfficeActivity 
+| where RecordType == "SharePointFileOperation" 
+| where UserId has UserPrincipalName_ and Operation in ("FileAccessed", "FileDownloaded")
+| project TimeGenerated, UserId, Operation, SourceFileName, Site_Url, OfficeWorkload, ClientIP
