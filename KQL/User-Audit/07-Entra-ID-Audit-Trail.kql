@@ -1,0 +1,5 @@
+// Entra ID Audit Trail
+// Description: Examines AuditLogs for administrative changes like password resets or user creation
+// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
+
+// TODO: Add KQL query here
