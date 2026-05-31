@@ -1,4 +1,55 @@
-// Base64 Encoded PowerShell
-// Description: Detects classic first-stage loader patterns (e.g., -enc) and decodes the Base64 blob to search for malicious indicators like IEX or Net.WebClient.
-
-// TODO: Add KQL query here
+// ============================================================
+// Hunt: Base64 Encoded PowerShell Execution
+// MITRE: T1059.001 | T1027 | T1140
+// ============================================================
+let LookbackPeriod = 7d;
+DeviceProcessEvents
+| where Timestamp > ago(LookbackPeriod)
+| where FileName has_any ("powershell.exe", "pwsh.exe", "powershell_ise.exe")
+| where ProcessCommandLine has_any ("-EncodedCommand", "-enc ", "-ec ", " -e ")
+      or (ProcessCommandLine has "base64" and ProcessCommandLine has_any ("FromBase64", "ToBase64", "[Convert]", "::FromBase64String"))
+| extend Base64Blob = extract(@"(?i)-e(?:nc(?:odedcommand)?)?\s+([A-Za-z0-9+/=]{20,})", 1, ProcessCommandLine)
+// Decode and strip UTF-16LE null bytes so has_any matching works correctly
+| extend DecodedHintRaw = base64_decode_tostring(coalesce(Base64Blob, ""))
+| extend DecodedHint    = replace_regex(DecodedHintRaw, @'[^\x20-\x7E\t\r\n]', '')
+| extend
+    DecodedHasDownload    = DecodedHint has_any ("DownloadString", "DownloadFile", "WebClient", "Invoke-WebRequest", "iwr", "irm"),
+    DecodedHasIEX         = DecodedHint has_any ("iex", "Invoke-Expression"),
+    DecodedHasReflection  = DecodedHint has_any ("Reflection.Assembly", "Assembly.Load", "LoadFrom"),
+    DecodedHasCredentials = DecodedHint has_any ("ConvertTo-SecureString", "Get-Credential", "PSCredential", "net use"),
+    DecodedHasAMSI        = DecodedHint has_any ("AmsiUtils", "amsiInitFailed", "amsiContext", "AmsiInitialize"),
+    DecodedHasMimikatz    = DecodedHint has_any ("Invoke-Mimikatz", "sekurlsa", "lsadump", "kerberos::"),
+    DecodedHasPersistence = DecodedHint has_any ("Register-ScheduledTask", "New-ItemProperty", "HKCU", "HKLM", "startup"),
+    HasHiddenWindow       = (ProcessCommandLine contains "-w h"
+                          or ProcessCommandLine contains "-w hidden"
+                          or ProcessCommandLine contains "-windowstyle h"
+                          or ProcessCommandLine contains "-windowstyle hidden"),
+    HasNoProfile          = ProcessCommandLine has_any ("-nop", "-noprofile"),
+    HasBypass             = ProcessCommandLine has_any ("-exec bypass", "-ep bypass"),
+    BlobLength            = strlen(Base64Blob)
+| extend DecodedIndicatorCount =
+    toint(DecodedHasDownload) + toint(DecodedHasIEX) + toint(DecodedHasReflection) +
+    toint(DecodedHasCredentials) + toint(DecodedHasAMSI) + toint(DecodedHasMimikatz) + toint(DecodedHasPersistence)
+| extend RiskScore =
+    DecodedIndicatorCount  * 20 +
+    toint(HasHiddenWindow) * 10 +
+    toint(HasBypass)       * 10 +
+    toint(HasNoProfile)    * 10 +
+    case(BlobLength > 2000, 25, BlobLength > 500, 15, BlobLength > 100, 5, 0)
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    ProcessCommandLine,
+    Base64Blob,
+    BlobLength,
+    DecodedHint,
+    RiskScore,
+    DecodedHasDownload, DecodedHasIEX, DecodedHasReflection,
+    DecodedHasCredentials, DecodedHasAMSI, DecodedHasMimikatz, DecodedHasPersistence,
+    HasHiddenWindow, HasNoProfile, HasBypass,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    SHA256,
+    ReportId
+| order by RiskScore desc, Timestamp desc
