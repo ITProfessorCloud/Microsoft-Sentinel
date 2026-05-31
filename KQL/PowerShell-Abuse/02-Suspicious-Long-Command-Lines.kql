@@ -1,0 +1,4 @@
+// Suspicious Long Command Lines
+// Description: Identifies fileless execution patterns where attackers hide payloads in long, obfuscated command strings.
+
+// TODO: Add KQL query here
