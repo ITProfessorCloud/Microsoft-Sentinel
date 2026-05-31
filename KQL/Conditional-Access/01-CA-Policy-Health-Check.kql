@@ -1,0 +1,5 @@
+// Conditional Access Policy Health Check
+// Description: Grades every CA policy by real sign-in data across all three sign-in tables. Shows true MFA coverage, block rates, and report-only disruption.
+// Blog: https://www.itprofessor.cloud/conditional-access-policy-health-check-kql/
+
+// TODO: Add KQL query here
