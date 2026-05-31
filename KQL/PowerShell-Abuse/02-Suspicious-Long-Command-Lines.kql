@@ -18,7 +18,7 @@ DeviceProcessEvents
     HasBase64Blob    = ProcessCommandLine matches regex @"[A-Za-z0-9+/]{100,}={0,2}",
     HasEncodedCmd    = ProcessCommandLine has_any ("-enc", "-EncodedCommand", "-ec "),
     HasDirectIEX     = ProcessCommandLine has_any ("| iex", "|iex", "| IEX", "|IEX", "iex(", "iex (", "Invoke-Expression"),
-    HasDownloadCradle= ProcessCommandLine has_any ("DownloadString", "DownloadFile", "Invoke-WebRequest", "Net.WebClient", "iwr ", "irm "),
+    HasDownloadCradle= ProcessCommandLine has_any ("DownloadString", "DownloadFile", "Invoke-WebRequest", "Net.WebClient", "iwr", "irm"),
     HasReflectionLoad= ProcessCommandLine has_any ("Assembly.Load", "Reflection.Assembly", "LoadFrom", "LoadFile"),
     HasAMSIBypass    = ProcessCommandLine has_any ("AmsiUtils", "amsiInitFailed", "amsiContext", "amsiSession", "AmsiInitialize"),
     HasCredTheft     = ProcessCommandLine has_any ("Invoke-Mimikatz", "sekurlsa", "lsadump", "ConvertFrom-SecureString", "Get-Credential"),
