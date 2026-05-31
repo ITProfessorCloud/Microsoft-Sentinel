@@ -1,0 +1,5 @@
+// Identity Record
+// Description: Pulls HR related context (job title, department, groups) from IdentityInfo table
+// Blog: https://www.itprofessor.cloud/kql-user-audit-playbook/
+
+// TODO: Add KQL query here
