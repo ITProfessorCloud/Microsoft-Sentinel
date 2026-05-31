@@ -1,13 +1,11 @@
-# 🎉 AuditLogs KQLs 🎉
+# AuditLogs Queries
 
-Welcome to the **AuditLogs KQLs** folder! 🕵️‍♂️🔍 Here, we dive into all things **AuditLogs** using Kusto Query Language (KQL)! Whether you're looking to track user activities, monitor changes, or just learn more about what's going on in your environment, you're in the right place.
+KQL queries for tracking user activities, password changes, and administrative actions in Azure AD AuditLogs.
 
-But who says AuditLogs have to be boring? 😜 We're bringing some fun to those logs with KQL queries that are practical, yet creative!
+## What's Here
 
-## In this folder, you'll find:
+**01-User-Activities-By-Name.kql**: Tracks all audit log activities for a specific user account. Useful for incident investigation and user behavior analysis.
 
-- **Tracking User Activities** 👨‍💻🔐
-- **Password Change Events** 🔑
-- **AuditTrail of Administrator Actions** 🛠️
-- **Sign-In Logs** 📅
-- And much more... 🎉
+**02-Password-Change-Events.kql**: Monitors password change and reset events across your tenant.
+
+**03-dMSA-Abuse.kql**: Detects potential abuse of Directory Managed Service Accounts.
