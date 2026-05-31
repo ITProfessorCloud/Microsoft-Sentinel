@@ -1,0 +1,4 @@
+// PowerShell Weakening Windows Defender
+// Description: Looks for command-line attempts to disable Defender features (real-time monitoring, script scanning) or add exclusions to staging paths.
+
+// TODO: Add KQL query here
