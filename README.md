@@ -9,9 +9,6 @@ This repository contains various resources related to **Microsoft Sentinel**, pr
 - **Playbooks**: Automation and orchestration examples for incident response.
 - **And More!** As this repository evolves, expect new contributions and updates.
 
-## 🎥 Check Out My YouTube Channel!
-For more detailed walkthroughs, tutorials, and updates, check out my [YouTube Channel](https://www.youtube.com/channel/UCMdH5UW4Iyi0iaUksW8hDPA/?sub_confirmation=1) 📹  
-Don't forget to **subscribe** for the latest videos on Microsoft Sentinel and cybersecurity topics! 🚀
 
 ## 🔧 Contribution
 Feel free to contribute to this repository! Open an issue or create a pull request if you have suggestions or improvements.
