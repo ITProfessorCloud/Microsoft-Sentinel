@@ -1,11 +1,10 @@
-# AuditLogs Queries
+# AuditLogs
 
-KQL queries for tracking user activities, password changes, and administrative actions in Azure AD AuditLogs.
+KQL queries focused on Microsoft Entra ID auditing, administrative activity, privileged access changes, password operations, and identity security monitoring using the `AuditLogs` table.
 
-## What's Here
+## Available Detections
 
-**01UserActivitiesByName.kql**: Tracks all audit log activities for a specific user account. Useful for incident investigation and user behavior analysis.
+| Rule | Description | Blog |
+|------|-------------|------|
+| [New Privileged Role Assignment Outside Baseline](./New%20Privileged%20Role%20Assignment%20Outside%20Baseline) | Detects first-seen privileged role assignments by comparing the last hour of activity against a 14-day baseline. Enriched with initiator history, identity context, and risk indicators to help identify suspicious privilege escalation and unauthorized access grants. | [Read Blog](https://www.itprofessor.cloud/fixing-the-privileged-role-assigned-outside-pim-analytic-rule/) |
 
-**02PasswordChangeEvents.kql**: Monitors password change and reset events across your tenant.
-
-**03dMSAAbuse.kql**: Detects potential abuse of Directory Managed Service Accounts.
