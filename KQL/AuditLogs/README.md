@@ -6,5 +6,4 @@ KQL queries focused on Microsoft Entra ID auditing, administrative activity, pri
 
 | Rule | Description | Blog |
 |------|-------------|------|
-| [New Privileged Role Assignment Outside Baseline](./New%20Privileged%20Role%20Assignment%20Outside%20Baseline) | Detects first-seen privileged role assignments by comparing the last hour of activity against a 14-day baseline. Enriched with initiator history, identity context, and risk indicators to help identify suspicious privilege escalation and unauthorized access grants. | [Read Blog](https://www.itprofessor.cloud/fixing-the-privileged-role-assigned-outside-pim-analytic-rule/) |
-
+| [New Privileged Role Assignment Outside Baseline](https://github.com/ITProfessorCloud/Microsoft-Sentinel/blob/main/KQL/AuditLogs/Analytic%20Rules/New%20Privileged%20Role%20Assignment%20Outside%20Baseline.json) | Detects first-seen privileged Microsoft Entra ID role assignments by comparing the last hour of activity against a 14-day baseline. Enriched with identity context, initiator history, and risk indicators to highlight potentially suspicious privilege escalation activity. | [Read Blog](https://www.itprofessor.cloud/fixing-the-privileged-role-assigned-outside-pim-analytic-rule/) |
