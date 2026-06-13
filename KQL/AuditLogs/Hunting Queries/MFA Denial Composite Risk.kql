@@ -1,0 +1,295 @@
+// =====================================================================
+// MFA Denial - Composite Risk Score
+// =====================================================================
+// Description : Detects risk-scored MFA denial events by correlating 14 weighted
+//               signals including fraud reports, threat intel, password spray,
+//               burst velocity, new countries, and UEBA enrichment per user.
+// Type        : Detection
+//
+// Tables      : SigninLogs, IdentityInfo, BehaviorAnalytics
+//
+// Tuning      : - CompositeScore >= 3 threshold - raise to 4-5 if alert volume is high
+//               - BaselineWindow (30d) - extend to 60d for travelling users to reduce UnknownIP FPs
+//               - VelocityWindow (15m) - tighten to 5m for faster burst detection
+//               - LookbackWindow (1h) - must align with queryFrequency
+//               - PasswordSprayIPs SprayUniqueUsers >= 5 - lower to 3 for small tenants
+//               - FirstTimeMFADenial weight (2) - reduce or remove if signal dominates noise
+//
+// Known FPs   : - Service accounts / shared mailboxes trigger NoRecentSuccessfulLogin; filter by IsServiceAccount
+//               - Travelling users trigger CountryMismatch until BaselineWindow catches up; extend baseline
+//               - Repeat habitual decliners inflate IsPersistentTarget; deprioritise with HistoricalDenialDays
+//
+// Author      : Bartosz Wysocki | https://www.itprofessor.cloud
+// Version     : 1.0 | 2025-06-13
+// =====================================================================
+let LookbackWindow = 1h;
+let BaselineWindow = 30d;
+let VelocityWindow = 15m;
+let LegacyAuthClients = dynamic(["Exchange ActiveSync", "IMAP4", "POP3", "SMTP Auth", "Other clients", "Authenticated SMTP"]);
+let KnownGoodIPs = materialize(
+    SigninLogs
+    | where TimeGenerated > ago(BaselineWindow)
+    | where ResultType == 0
+    | where isnotempty(UserPrincipalName)
+    | where ClientAppUsed !in (LegacyAuthClients)
+    | summarize KnownIPs = make_set(IPAddress), KnownCountries = make_set(tostring(LocationDetails.countryOrRegion)) by UserPrincipalName = tolower(UserPrincipalName));
+let MFADenialBaseline = materialize(
+    SigninLogs
+    | where TimeGenerated > ago(BaselineWindow)
+    | where ResultType == 500121
+    | where isnotempty(UserPrincipalName)
+    | extend additionalDetails_ = tostring(Status.additionalDetails)
+    | where additionalDetails_ =~ "MFA denied; user declined the authentication" or additionalDetails_ has "fraud"
+    | summarize
+        HistoricalDenialCount = count(),
+        HistoricalDenialDays = dcount(bin(TimeGenerated, 1d)),
+        HistoricalDenialIPs = make_set(IPAddress)
+        by UserPrincipalName = tolower(UserPrincipalName));
+let RecentSuccessfulLogins = SigninLogs
+    | where TimeGenerated > ago(7d)
+    | where ResultType == 0
+    | where isnotempty(UserPrincipalName)
+    | where ClientAppUsed !in (LegacyAuthClients)
+    | summarize
+        SuccessfulIPs = make_set(IPAddress),
+        LastSuccessfulLogin = max(TimeGenerated),
+        SuccessfulCountries = make_set(tostring(LocationDetails.countryOrRegion)),
+        ConditionalAccessPolicies = make_set(tostring(ConditionalAccessPolicies))
+        by UserPrincipalName = tolower(UserPrincipalName);
+let VelocityCheck = SigninLogs
+    | where TimeGenerated > ago(VelocityWindow)
+    | where ResultType == 500121
+    | where isnotempty(UserPrincipalName)
+    | extend additionalDetails_ = tostring(Status.additionalDetails)
+    | where additionalDetails_ =~ "MFA denied; user declined the authentication" or additionalDetails_ has "fraud"
+    | summarize VelocityCount = count() by UserPrincipalName = tolower(UserPrincipalName);
+let FraudReports = SigninLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where ResultType == 500121
+    | where isnotempty(UserPrincipalName)
+    | extend additionalDetails_ = tostring(Status.additionalDetails)
+    | where additionalDetails_ has "fraud"
+    | summarize FraudReportCount = count() by UserPrincipalName = tolower(UserPrincipalName);
+let PasswordSprayIPs = SigninLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where ResultType == 50126
+    | where isnotempty(UserPrincipalName)
+    | summarize SprayUniqueUsers = dcount(UserPrincipalName), SprayAttemptCount = count() by IPAddress
+    | where SprayUniqueUsers >= 5
+    | project FailedIPAddress = IPAddress, SprayUniqueUsers, SprayAttemptCount;
+let FailedAttempts = SigninLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where ResultType == 500121
+    | where isnotempty(UserPrincipalName)
+    | extend additionalDetails_ = tostring(Status.additionalDetails)
+    | where additionalDetails_ =~ "MFA denied; user declined the authentication" or additionalDetails_ has "fraud"
+    | extend UserPrincipalName = tolower(UserPrincipalName)
+    | extend Country = tostring(LocationDetails.countryOrRegion)
+    | extend City = tostring(LocationDetails.city)
+    | summarize
+        TimeGenerated = max(TimeGenerated),
+        FirstDenialInWindow = min(TimeGenerated),
+        FailedIPAddresses = make_set(IPAddress),
+        FailedIPAddress = any(IPAddress),
+        Countries = make_set(Country),
+        Cities = make_set(City),
+        AppsTargeted = make_set(AppDisplayName),
+        ClientAppsUsed = make_set(ClientAppUsed),
+        DeviceDisplayName = any(DeviceDetail.displayName),
+        DeviceIsCompliant = any(DeviceDetail.isCompliant),
+        DeviceIsManaged = any(DeviceDetail.isManaged),
+        DeviceTrustType = any(DeviceDetail.trustType),
+        DeviceOS = any(DeviceDetail.operatingSystem),
+        DeviceId = any(DeviceDetail.deviceId),
+        RiskLevelDuringSignIn = any(RiskLevelDuringSignIn),
+        RiskLevelAggregated = any(RiskLevelAggregated),
+        RiskState = any(RiskState),
+        ConditionalAccessStatus = any(ConditionalAccessStatus),
+        AuthenticationRequirement = any(AuthenticationRequirement),
+        FailureCount = count()
+        by UserPrincipalName, UserId, AADTenantId;
+FailedAttempts
+| extend Name = tolower(tostring(split(UserPrincipalName, '@', 0)[0]))
+| extend UPNSuffix = tostring(split(UserPrincipalName, '@', 1)[0])
+| join kind=leftouter RecentSuccessfulLogins on UserPrincipalName
+| join kind=leftouter KnownGoodIPs on UserPrincipalName
+| join kind=leftouter MFADenialBaseline on UserPrincipalName
+| join kind=leftouter VelocityCheck on UserPrincipalName
+| join kind=leftouter FraudReports on UserPrincipalName
+| join kind=leftouter PasswordSprayIPs on FailedIPAddress
+| join kind=leftouter (
+    IdentityInfo
+    | where TimeGenerated > ago(BaselineWindow)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN
+    | project
+        AccountUPN,
+        Tags,
+        JobTitle,
+        Department,
+        Manager,
+        GroupMembership,
+        AssignedRoles,
+        UserType,
+        IsAccountEnabled,
+        IsMFARegistered,
+        IsServiceAccount,
+        EntityRiskScore,
+        UserStateChangedOn
+    | extend UserPrincipalName = tolower(AccountUPN)
+) on UserPrincipalName
+| join kind=leftouter (
+    BehaviorAnalytics
+    | where ActivityType in ("FailedLogOn", "LogOn")
+    | where isnotempty(SourceIPAddress)
+    | where isnotempty(UserName)
+    | extend BAUserName = tolower(UserName)
+    | extend ISP_ = coalesce(tostring(DevicesInsights.ISP), "Not Available")
+    | extend ThreatIntelType = tostring(DevicesInsights.ThreatIntelIndicatorType)
+    | extend ThreatIntelDescription = tostring(DevicesInsights.ThreatIntelIndicatorDescription)
+    | summarize arg_max(TimeGenerated, *)
+        by FailedIPAddress = SourceIPAddress, BAUserName
+    | extend ISP_ = coalesce(tostring(DevicesInsights.ISP), "Not Available")
+    | extend ThreatIntelType = tostring(DevicesInsights.ThreatIntelIndicatorType)
+    | extend ThreatIntelDescription = tostring(DevicesInsights.ThreatIntelIndicatorDescription)
+    | project FailedIPAddress, BAUserName, ISP_, ThreatIntelType, ThreatIntelDescription, MaxInvestigationScore = InvestigationPriority, UsersInsights, DevicesInsights, ActivityInsights
+) on FailedIPAddress, $left.Name == $right.BAUserName
+| extend SuccessfulIPs = coalesce(SuccessfulIPs, dynamic([]))
+| extend KnownIPs = coalesce(KnownIPs, dynamic([]))
+| extend KnownCountries = coalesce(KnownCountries, dynamic([]))
+| extend VelocityCount = coalesce(VelocityCount, 0)
+| extend FraudReportCount = coalesce(FraudReportCount, 0)
+| extend HistoricalDenialCount = coalesce(HistoricalDenialCount, 0)
+| extend HistoricalDenialDays = coalesce(HistoricalDenialDays, 0)
+| extend UEBARiskScore = coalesce(MaxInvestigationScore, 0)
+| extend SprayUniqueUsers = coalesce(SprayUniqueUsers, 0)
+| extend SprayAttemptCount = coalesce(SprayAttemptCount, 0)
+| extend NewCountries = set_difference(Countries, KnownCountries)
+| extend CountryMismatch = array_length(NewCountries) > 0
+| extend IsFailedIPKnownGood = iff(array_index_of(KnownIPs, FailedIPAddress) != -1, true, false)
+| extend IsFailedIPRecentSuccess = iff(array_index_of(SuccessfulIPs, FailedIPAddress) != -1, true, false)
+| extend HadRecentSuccessfulLogin = iff(isnotempty(LastSuccessfulLogin) and LastSuccessfulLogin > ago(1h), true, false)
+| extend IsFirstTimeDenial = iff(HistoricalDenialCount == 0, true, false)
+| extend IsPersistentTarget = iff(HistoricalDenialDays >= 3, true, false)
+| extend IsBurstAttack = iff(VelocityCount >= 3, true, false)
+| extend IsFraudReport = iff(FraudReportCount > 0, true, false)
+| extend IsHighPrivilegeUser = iff(isnotempty(tostring(AssignedRoles)) and tostring(AssignedRoles) != "[]", true, false)
+| extend IsAccountDisabled = iff(IsAccountEnabled == false, true, false)
+| extend AADRiskElevated = iff(RiskLevelDuringSignIn in ("medium", "high"), true, false)
+| extend IsThreatIntelHit = iff(isnotempty(ThreatIntelType), true, false)
+| extend IsPasswordSprayIP = iff(SprayUniqueUsers >= 5, true, false)
+| extend CompositeScore = 0
+| extend CompositeScore = CompositeScore + iff(IsFraudReport, 5, 0)
+| extend CompositeScore = CompositeScore + iff(IsThreatIntelHit, 4, 0)
+| extend CompositeScore = CompositeScore + iff(IsPasswordSprayIP, 4, 0)
+| extend CompositeScore = CompositeScore + iff(IsBurstAttack, 3, 0)
+| extend CompositeScore = CompositeScore + iff(CountryMismatch, 3, 0)
+| extend CompositeScore = CompositeScore + iff(IsAccountDisabled, 3, 0)
+| extend CompositeScore = CompositeScore + iff(not(IsFailedIPKnownGood), 2, 0)
+| extend CompositeScore = CompositeScore + iff(IsFirstTimeDenial, 2, 0)
+| extend CompositeScore = CompositeScore + iff(IsHighPrivilegeUser, 2, 0)
+| extend CompositeScore = CompositeScore + iff(AADRiskElevated, 2, 0)
+| extend CompositeScore = CompositeScore + iff(IsPersistentTarget, 2, 0)
+| extend CompositeScore = CompositeScore + iff(UEBARiskScore > 3, 2, 0)
+| extend CompositeScore = CompositeScore + iff(HadRecentSuccessfulLogin == false, 1, 0)
+| extend CompositeScore = CompositeScore + iff(FailureCount > 5, 1, 0)
+| extend Risk_1 = iff(IsFraudReport, strcat("MFAFraudReported(", tostring(FraudReportCount), ")"), "")
+| extend Risk_2 = iff(IsThreatIntelHit, strcat("ThreatIntel:", ThreatIntelType), "")
+| extend Risk_3 = iff(IsPasswordSprayIP, strcat("PasswordSprayIP(", tostring(SprayUniqueUsers), "users)"), "")
+| extend Risk_4 = iff(IsBurstAttack, strcat("BurstAttack(", tostring(VelocityCount), "in15min)"), "")
+| extend Risk_5 = iff(CountryMismatch, strcat("NewCountry(", strcat_array(NewCountries, ","), ")"), "")
+| extend Risk_6 = iff(IsAccountDisabled, "AccountDisabled", "")
+| extend Risk_7 = iff(not(IsFailedIPKnownGood), "UnknownIP", "")
+| extend Risk_8 = iff(IsFirstTimeDenial, "FirstTimeMFADenial", "")
+| extend Risk_9 = iff(IsPersistentTarget, strcat("PersistentTarget(", tostring(HistoricalDenialDays), "days)"), "")
+| extend Risk_10 = iff(IsHighPrivilegeUser, "HighPrivilegeUser", "")
+| extend Risk_11 = iff(AADRiskElevated, strcat("AADRisk:", RiskLevelDuringSignIn), "")
+| extend Risk_12 = iff(HadRecentSuccessfulLogin == false, "NoRecentSuccessfulLogin", "")
+| extend Risk_13 = iff(FailureCount > 5, strcat("HighDenialVolume(", tostring(FailureCount), ")"), "")
+| extend Risk_14 = iff(UEBARiskScore > 3, strcat("UEBAScore:", tostring(UEBARiskScore)), "")
+| extend RiskIndicators = trim(@"\s*\|\s*$", strcat(
+    iff(isnotempty(Risk_1), strcat(Risk_1, " | "), ""),
+    iff(isnotempty(Risk_2), strcat(Risk_2, " | "), ""),
+    iff(isnotempty(Risk_3), strcat(Risk_3, " | "), ""),
+    iff(isnotempty(Risk_4), strcat(Risk_4, " | "), ""),
+    iff(isnotempty(Risk_5), strcat(Risk_5, " | "), ""),
+    iff(isnotempty(Risk_6), strcat(Risk_6, " | "), ""),
+    iff(isnotempty(Risk_7), strcat(Risk_7, " | "), ""),
+    iff(isnotempty(Risk_8), strcat(Risk_8, " | "), ""),
+    iff(isnotempty(Risk_9), strcat(Risk_9, " | "), ""),
+    iff(isnotempty(Risk_10), strcat(Risk_10, " | "), ""),
+    iff(isnotempty(Risk_11), strcat(Risk_11, " | "), ""),
+    iff(isnotempty(Risk_12), strcat(Risk_12, " | "), ""),
+    iff(isnotempty(Risk_13), strcat(Risk_13, " | "), ""),
+    iff(isnotempty(Risk_14), strcat(Risk_14, " | "), "")
+))
+| where CompositeScore >= 3
+| project
+    TimeGenerated,
+    FirstDenialInWindow,
+    UserPrincipalName,
+    Name,
+    UPNSuffix,
+    UserId,
+    AADTenantId,
+    CompositeScore,
+    RiskIndicators,
+    FailureCount,
+    VelocityCount,
+    IsBurstAttack,
+    IsFraudReport,
+    FraudReportCount,
+    IsFirstTimeDenial,
+    IsPersistentTarget,
+    HistoricalDenialCount,
+    HistoricalDenialDays,
+    IsPasswordSprayIP,
+    SprayUniqueUsers,
+    SprayAttemptCount,
+    FailedIPAddress,
+    FailedIPAddresses,
+    Countries,
+    NewCountries,
+    Cities,
+    CountryMismatch,
+    IsFailedIPKnownGood,
+    IsFailedIPRecentSuccess,
+    KnownCountries,
+    SuccessfulCountries,
+    AppsTargeted,
+    ClientAppsUsed,
+    ConditionalAccessStatus,
+    ConditionalAccessPolicies,
+    AuthenticationRequirement,
+    RiskLevelDuringSignIn,
+    RiskLevelAggregated,
+    RiskState,
+    DeviceDisplayName,
+    DeviceIsCompliant,
+    DeviceIsManaged,
+    DeviceTrustType,
+    DeviceOS,
+    DeviceId,
+    JobTitle,
+    Department,
+    Manager,
+    GroupMembership,
+    AssignedRoles,
+    UserType,
+    IsAccountEnabled,
+    IsMFARegistered,
+    IsHighPrivilegeUser,
+    IsAccountDisabled,
+    EntityRiskScore,
+    UserStateChangedOn,
+    Tags,
+    UEBARiskScore,
+    ISP_,
+    ThreatIntelType,
+    ThreatIntelDescription,
+    UsersInsights,
+    DevicesInsights,
+    ActivityInsights,
+    LastSuccessfulLogin,
+    HadRecentSuccessfulLogin,
+    SuccessfulIPs
+| sort by CompositeScore desc, FailureCount desc
