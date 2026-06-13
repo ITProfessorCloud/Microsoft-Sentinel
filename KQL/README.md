@@ -1,28 +1,68 @@
-# KQL Queries for Microsoft Sentinel 🔍
+# KQL Detection Engineering Repository
 
-Welcome to the **KQL Queries** folder! Here you'll find a collection of **useful** and **fun** Kusto Query Language (KQL) queries designed to enhance your experience with **Microsoft Sentinel**. These queries are meant to help with tasks like monitoring, incident investigation, and automation.
+A production-grade collection of KQL analytic rules and hunting queries for Microsoft Sentinel, maintained by [Bartosz Wysocki](https://www.itprofessor.cloud).
 
-## 📂 What's Inside:
-- **Useful KQL Queries**: Practical queries that can be directly used in **Microsoft Sentinel** to monitor security data, identify incidents, and improve security operations.
-- **Fun KQL Queries**: A collection of quirky and interesting queries that add a bit of fun to working with Sentinel. These may include creative ways to visualize data or discover unusual patterns.
-- **Custom Queries**: As this folder grows, you'll find custom queries tailored to specific security scenarios or use cases.
+Every rule and query in this repository is built to be deployed directly into production Sentinel workspaces with minimal modification. Each file ships with tuning notes, known false positives, MITRE ATT&CK mappings, and investigation guidance baked into the header.
 
-## 🛠️ How to Use:
-1. Browse through the KQL query files.
-2. Copy any query you find useful or interesting.
-3. Paste it into the **Microsoft Sentinel** portal to run it against your data.
-4. Modify and tweak the queries as needed for your specific environment.
+## Repository Structure
 
-## 🧑‍💻 Contribution:
-If you have any fun or useful KQL queries you'd like to contribute, feel free to submit a pull request. Suggestions for new queries are also welcome!
+```
+/analytic-rules/     Scheduled analytic rules — ARM templates (.json) and readable KQL (.kql)
+/hunting-queries/    Threat hunting and investigation queries (.kql)
+```
 
-## 📈 Query Categories:
-- **Incident Investigation**: Queries that help with finding and analyzing security incidents.
-- **Performance and Health Monitoring**: Queries to track the health and performance of Sentinel.
-- **Alerting**: Queries focused on alert generation and management.
-- **Visualization**: Fun queries that generate cool visualizations or insights.
+Analytic rules ship as pairs: a deployable ARM template and a matching `.kql` file with the raw unescaped query for easy reading and modification.
 
----
+## Deploying Analytic Rules
 
-Feel free to explore and use the queries! 🚀
+1. Open the Azure Portal and navigate to your Sentinel workspace.
+2. Go to **Configuration > Analytics > Import**.
+3. Upload the `.json` ARM template for the rule you want to deploy.
+4. Review the rule settings, adjust any tuning parameters noted in the description, and enable.
 
+Alternatively, deploy via Azure CLI:
+
+```bash
+az deployment group create \
+  --resource-group <your-rg> \
+  --template-file <rule-id>.json \
+  --parameters workspace=<your-workspace-name>
+```
+
+## Query File Format
+
+Every `.kql` file opens with a structured header covering description, tables, required license, tuning knobs, and known false positives. Read the header before running any query in production.
+
+```
+// =====================================================================
+// Detection Name
+// =====================================================================
+// Description : What this finds
+// Type        : Scheduled | Hunt | Investigation | Reporting
+// Tables      : AuditLogs, IdentityInfo, ...
+// Tuning      : ...
+// Known FPs   : ...
+// Version     : 1.0 | YYYY-MM-DD
+// =====================================================================
+```
+
+## Requirements
+
+- Microsoft Sentinel workspace
+- Relevant data connectors enabled (listed per rule in the query header)
+
+## Contributing
+
+Pull requests are welcome. To contribute a rule or query:
+
+1. Fork the repository.
+2. Use the existing `.kql` header format and ARM skeleton for consistency.
+3. Include MITRE ATT&CK mappings, tuning notes, and known false positives.
+4. Submit a pull request with a short description of what the detection covers.
+
+Rules or queries submitted without tuning guidance or false positive notes will be returned for revision before merging.
+
+## Author
+
+Bartosz Wysocki
+[itprofessor.cloud](https://www.itprofessor.cloud)
