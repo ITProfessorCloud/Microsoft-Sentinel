@@ -17,7 +17,7 @@
 //               - Automated provisioning SPNs appearing as first-time initiators; add to exclusion watchlist
 //
 // Author      : Bartosz Wysocki | https://www.itprofessor.cloud
-// Version     : 1.0 | 2025-06-13
+// Version     : 1.0 | 2026-06-13
 // =====================================================================
 let PrivilegedRoles = dynamic([
 "Global Administrator",
