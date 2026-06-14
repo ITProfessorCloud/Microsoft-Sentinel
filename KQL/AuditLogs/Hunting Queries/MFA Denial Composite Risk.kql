@@ -20,7 +20,7 @@
 //               - Repeat habitual decliners inflate IsPersistentTarget; deprioritise with HistoricalDenialDays
 //
 // Author      : Bartosz Wysocki | https://www.itprofessor.cloud
-// Version     : 1.0 | 2025-06-13
+// Version     : 1.0 | 2026-06-13
 // =====================================================================
 let LookbackWindow = 1h;
 let BaselineWindow = 30d;
