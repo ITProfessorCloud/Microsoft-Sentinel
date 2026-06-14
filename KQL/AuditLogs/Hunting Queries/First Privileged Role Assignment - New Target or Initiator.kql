@@ -22,7 +22,7 @@
 //               - Automated provisioning tools or HR-sync apps granting roles as service principals - baseline clears over 14 days
 //
 // Author      : Bartosz Wysocki | https://www.itprofessor.cloud
-// Version     : 1.0 | 2025-06-14
+// Version     : 1.0 | 2026-06-14
 // =====================================================================
 let PrivilegedRoles = dynamic([
 "Global Administrator",
