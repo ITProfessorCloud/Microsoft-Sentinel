@@ -1,0 +1,104 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/first-privileged-role-assignment')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/first-privileged-role-assignment')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "First Privileged Role Assignment - New Target or Initiator",
+                "description": "Detects the first time a user or service principal is assigned a privileged or critical Entra ID role, using a 14-day anti-join baseline to suppress known assignments. Enriches each result with initiator behaviour history, target identity context (department, MFA status, account age, entity risk), and a composite RiskIndicators field flagging high-signal combinations such as critical role assignment, active (non-eligible) grants, first-time initiators, recently created accounts, and service principal targets.\n\nTABLES: AuditLogs, IdentityInfo\nCONNECTORS: Microsoft Entra ID (Diagnostic Settings - AuditLogs), Microsoft Sentinel UEBA (IdentityInfo)\nLICENSE: Microsoft Sentinel (Log Analytics workspace) + Microsoft Entra ID P2 (UEBA / IdentityInfo)\n\nTUNING:\n1. PrivilegedRoles list - controls which role names trigger the rule; add/remove based on your Tier-1 definition\n2. CriticalRoles list - subset that sets Risk_1 / CriticalRoleAssigned; align with your Tier-0 boundary\n3. LookbackWindow variables (ago(14d), ago(1h), ago(2h)) - widen or narrow the baseline and detection windows\n4. TargetAccountAgeDays < 7 threshold - lower to catch older accounts, raise to reduce noise\n5. IsFirstTimeInitiator logic - remove if first-time initiator signal produces excessive false positives in your tenant\n\nKNOWN FALSE POSITIVES:\n1. Legitimate role grants by IAM/IT teams during provisioning or offboarding - validate against change tickets\n2. Break-glass or emergency access account activations - maintain an exclusion list of known break-glass UPNs\n3. Microsoft-internal service accounts (MS-PIM) initiating automated assignments - handled by PimRequesters join but verify if Initiator still shows MS-PIM\n4. Automated provisioning tools or HR-sync apps granting roles as service principals - baseline clears over 14 days\n\nINVESTIGATION STEPS:\n1. Check Initiator - known IAM admin or unexpected account? Cross-reference against HR/IT directory.\n2. Review RiskIndicators - each flag raises severity; CriticalRoleAssigned + FirstTimeInitiator + ActiveAssignment together = immediate escalation.\n3. Examine HistoricalAssignmentCount - zero means initiator has never assigned a privileged role before.\n4. Check TargetAccountAgeDays - very low values (< 7) suggest a create-then-elevate chain; pull the account creation audit event.\n5. Verify AssignmentType - Eligible assignments are lower risk than Active; Active grants immediate role permissions.\n6. Review InitiatorEntityRiskScore and TargetEntityRiskScore in Sentinel UEBA for additional anomaly signals.\n7. Correlate CorrelationId against AuditLogs to see the full PIM request chain if AssignedRoleName is a PIM-managed role.\n8. If TargetType is ServicePrincipal, investigate the app registration and its existing API permissions.\n\nBLIND SPOTS:\nRole-assignable group membership changes are not covered; add companion detection on group membership events for full coverage. Role assignments in non-home tenants (B2B/GDAP) may not appear in AuditLogs. IdentityInfo UEBA columns silently return empty if UEBA is not enabled.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 1.0 | 2025-06-14",
+                "severity": "High",
+                "enabled": true,
+                "query": "// =====================================================================\n// First Privileged Role Assignment - New Target or Initiator\n// =====================================================================\n// Tables  : AuditLogs, IdentityInfo\n// License : Microsoft Sentinel + Microsoft Entra ID P2 (UEBA)\n// Tuning  : see rule description for full tuning notes\n// Author  : Bartosz Wysocki | itprofessor.cloud\n// Version : 1.0 | 2025-06-14\n// =====================================================================\nlet PrivilegedRoles = dynamic([\n\"Global Administrator\",\n\"Privileged Role Administrator\",\n\"Privileged Authentication Administrator\",\n\"Partner Tier1 Support\",\n\"Partner Tier2 Support\",\n\"Security Administrator\",\n\"Exchange Administrator\",\n\"SharePoint Administrator\",\n\"User Administrator\",\n\"Authentication Administrator\",\n\"Conditional Access Administrator\",\n\"Application Administrator\",\n\"Cloud Application Administrator\",\n\"Hybrid Identity Administrator\",\n\"Intune Administrator\",\n\"Password Administrator\",\n\"Directory Writers\",\n\"Global Reader\",\n\"Security Operator\",\n\"Security Reader\"\n]);\nlet CriticalRoles = dynamic([\n\"Global Administrator\",\n\"Privileged Role Administrator\",\n\"Privileged Authentication Administrator\",\n\"Partner Tier2 Support\"\n]);\n// Reusable parser for successful privileged role assignments\nlet RoleAssignments = (start:datetime, end:datetime) {\n    AuditLogs\n    | where TimeGenerated between (start .. end)\n    | where Category =~ \"RoleManagement\"\n    | where AADOperationType in (\"Assign\", \"AssignEligibleRole\")\n    | where ActivityDisplayName has_any (\"Add eligible member to role\", \"Add member to role\")\n    | where ResultType =~ \"success\" or Result =~ \"success\"\n    | mv-apply TargetResource = TargetResources on (\n        where TargetResource.type in~ (\"User\", \"ServicePrincipal\")\n        | extend\n            TargetId = tostring(TargetResource.id),\n            TargetType = tostring(TargetResource.type),\n            Target = iff(TargetResource.type =~ \"ServicePrincipal\", tostring(TargetResource.displayName), tostring(TargetResource.userPrincipalName)),\n            props = TargetResource.modifiedProperties\n    )\n    | mv-apply Property = props on (\n        where Property.displayName =~ \"Role.DisplayName\"\n        | extend AssignedRoleName = trim('\"', tostring(Property.newValue))\n    )\n    | where AssignedRoleName in~ (PrivilegedRoles)\n};\n// Historical leg: only the columns the anti-join needs\nlet HistoricalAssignments = RoleAssignments(ago(14d), ago(1h))\n    | distinct TargetId, AssignedRoleName;\n// 14-day baseline of who assigns privileged roles\nlet InitiatorHistory = AuditLogs\n    | where TimeGenerated > ago(14d)\n    | where Category =~ \"RoleManagement\"\n    | where AADOperationType in (\"Assign\", \"AssignEligibleRole\")\n    | where ActivityDisplayName has_any (\"Add eligible member to role\", \"Add member to role\")\n    | extend InitiatingUserPrincipalName = tostring(InitiatedBy.user.userPrincipalName)\n    | where isnotempty(InitiatingUserPrincipalName)\n    | summarize HistoricalAssignmentCount = count(), FirstSeenAssigning = min(TimeGenerated), LastSeenAssigning = max(TimeGenerated) by InitiatingUserPrincipalName;\nlet IdentityContext = IdentityInfo\n    | where TimeGenerated > ago(14d)\n    | summarize arg_max(TimeGenerated, *) by AccountUPN\n    | project AccountUPN, AccountCreationTime, Department, JobTitle, Manager, AssignedRoles, IsMFARegistered, IsAccountEnabled, IsServiceAccount, EntityRiskScore, UserType;\n// Recover the human requester behind MS-PIM initiated assignments\nlet PimRequesters = AuditLogs\n    | where TimeGenerated > ago(2h)\n    | where Category =~ \"RoleManagement\"\n    | where OperationName has \"PIM\" and OperationName has \"requested\"\n    | extend RequestedBy = tostring(InitiatedBy.user.userPrincipalName)\n    | where isnotempty(RequestedBy) and isnotempty(CorrelationId)\n    | distinct CorrelationId, RequestedBy;\nRoleAssignments(ago(1h), now())\n| join kind=leftanti HistoricalAssignments on TargetId, AssignedRoleName\n| extend AssignmentType = iff(AADOperationType =~ \"AssignEligibleRole\", \"Eligible\", \"Active\")\n| extend InitiatingAppName = tostring(InitiatedBy.app.displayName)\n| extend InitiatingAppServicePrincipalId = tostring(InitiatedBy.app.servicePrincipalId)\n| extend InitiatingUserPrincipalName = tostring(InitiatedBy.user.userPrincipalName)\n| extend InitiatingAadUserId = tostring(InitiatedBy.user.id)\n| extend InitiatingIpAddress = tostring(iff(isnotempty(InitiatedBy.user.ipAddress), InitiatedBy.user.ipAddress, InitiatedBy.app.ipAddress))\n| extend Initiator = iif(isnotempty(InitiatingAppName), InitiatingAppName, InitiatingUserPrincipalName)\n| join kind=leftouter PimRequesters on CorrelationId\n| extend Initiator = iff(Initiator in (\"MS-PIM\", \"MS-PIM-Fairfax\") and isnotempty(RequestedBy), RequestedBy, Initiator)\n| extend InitiatingUserPrincipalName = iff(isempty(InitiatingUserPrincipalName) and isnotempty(RequestedBy), RequestedBy, InitiatingUserPrincipalName)\n| join kind=leftouter InitiatorHistory on InitiatingUserPrincipalName\n| extend IsFirstTimeInitiator = isnull(HistoricalAssignmentCount) or HistoricalAssignmentCount == 0\n| extend HistoricalAssignmentCount = coalesce(HistoricalAssignmentCount, 0)\n| join kind=leftouter IdentityContext on $left.Target == $right.AccountUPN\n| extend TargetAccountAgeDays = datetime_diff('day', now(), AccountCreationTime)\n| extend TargetDepartment = Department\n| extend TargetJobTitle = JobTitle\n| extend TargetManager = Manager\n| extend TargetCurrentRoles = tostring(AssignedRoles)\n| extend TargetMFARegistered = IsMFARegistered\n| extend TargetIsServiceAccount = IsServiceAccount\n| extend TargetAccountEnabled = IsAccountEnabled\n| extend TargetEntityRiskScore = tostring(EntityRiskScore)\n| extend TargetUserType = UserType\n| join kind=leftouter (\n    IdentityContext\n    | project InitiatorAccountUPN = AccountUPN, InitiatorDepartment = Department, InitiatorJobTitle = JobTitle, InitiatorCurrentRoles = tostring(AssignedRoles), InitiatorMFARegistered = IsMFARegistered, InitiatorEntityRiskScore = tostring(EntityRiskScore)\n) on $left.InitiatingUserPrincipalName == $right.InitiatorAccountUPN\n| extend TargetName = tostring(split(Target, '@', 0)[0])\n| extend TargetUPNSuffix = tostring(split(Target, '@', 1)[0])\n| extend InitiatedByName = tostring(split(InitiatingUserPrincipalName, '@', 0)[0])\n| extend InitiatedByUPNSuffix = tostring(split(InitiatingUserPrincipalName, '@', 1)[0])\n| extend Risk_1 = iff(AssignedRoleName in~ (CriticalRoles), \"CriticalRoleAssigned\", \"\")\n| extend Risk_2 = iff(AssignmentType == \"Active\", \"ActiveAssignment\", \"\")\n| extend Risk_3 = iff(IsFirstTimeInitiator, \"FirstTimeInitiator\", \"\")\n| extend Risk_4 = iff(TargetAccountAgeDays < 7, \"RecentlyCreatedAccount\", \"\")\n| extend Risk_5 = iff(TargetIsServiceAccount == true, \"TargetIsServiceAccount\", \"\")\n| extend Risk_6 = iff(TargetType =~ \"ServicePrincipal\", \"TargetIsServicePrincipal\", \"\")\n| extend Risk_7 = iff(isempty(InitiatingIpAddress), \"NoIPAddressLogged\", \"\")\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n    iff(isnotempty(Risk_1), strcat(Risk_1, \" | \"), \"\"),\n    iff(isnotempty(Risk_2), strcat(Risk_2, \" | \"), \"\"),\n    iff(isnotempty(Risk_3), strcat(Risk_3, \" | \"), \"\"),\n    iff(isnotempty(Risk_4), strcat(Risk_4, \" | \"), \"\"),\n    iff(isnotempty(Risk_5), strcat(Risk_5, \" | \"), \"\"),\n    iff(isnotempty(Risk_6), strcat(Risk_6, \" | \"), \"\"),\n    iff(isnotempty(Risk_7), strcat(Risk_7, \" | \"), \"\")\n))\n| project\n    TimeGenerated, ActivityDateTime, OperationName, AADOperationType,\n    AssignedRoleName, AssignmentType,\n    Target, TargetId, TargetType, TargetName, TargetUPNSuffix,\n    TargetDepartment, TargetJobTitle, TargetManager, TargetCurrentRoles,\n    TargetMFARegistered, TargetIsServiceAccount, TargetAccountEnabled,\n    TargetEntityRiskScore, TargetUserType, TargetAccountAgeDays,\n    Initiator, InitiatingUserPrincipalName, InitiatedByName, InitiatedByUPNSuffix,\n    InitiatingIpAddress, InitiatingAppName, InitiatingAppServicePrincipalId, InitiatingAadUserId,\n    InitiatorDepartment, InitiatorJobTitle, InitiatorCurrentRoles,\n    InitiatorMFARegistered, InitiatorEntityRiskScore,\n    IsFirstTimeInitiator, HistoricalAssignmentCount, FirstSeenAssigning, LastSeenAssigning,\n    RiskIndicators, CorrelationId, LoggedByService, Result\n| sort by TimeGenerated desc",
+                "queryFrequency": "PT1H",
+                "queryPeriod": "P14D",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": ["PrivilegeEscalation", "Persistence"],
+                "techniques": ["T1098", "T1078", "T1136"],
+                "subTechniques": ["T1098.003", "T1078.004", "T1136.003"],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT2H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": ["Account"],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": null
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "SingleAlert"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "Privileged Role Assigned: {{AssignedRoleName}} granted to {{Target}} by {{Initiator}}",
+                    "alertDescriptionFormat": "Risk flags: {{RiskIndicators}} | Assignment type: {{AssignmentType}} | Initiator IP: {{InitiatingIpAddress}}"
+                },
+                "customDetails": {
+                    "AssignedRoleName": "AssignedRoleName",
+                    "AssignmentType": "AssignmentType",
+                    "RiskIndicators": "RiskIndicators",
+                    "FirstTimeInitiator": "IsFirstTimeInitiator",
+                    "HistoricalCount": "HistoricalAssignmentCount",
+                    "TargetAgeDays": "TargetAccountAgeDays",
+                    "TargetEnabled": "TargetAccountEnabled",
+                    "TargetSvcAccount": "TargetIsServiceAccount"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "InitiatedByName"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "InitiatedByUPNSuffix"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "TargetName"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "TargetUPNSuffix"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "InitiatingIpAddress"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}
