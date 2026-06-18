@@ -1,0 +1,114 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/rare-rdp-connection-defender-endpoint')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/rare-rdp-connection-defender-endpoint')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "Rare RDP Connection - Defender for Endpoint (DeviceLogonEvents)",
+                "description": "Detects RemoteInteractive (RDP) logons that are anomalous by destination (the account has not RDP'd to this host in the 14-day baseline), new by source host, or arriving from a public source IP. Built on DeviceLogonEvents to avoid the Security Event silent-coverage gap and to use native RemoteIPType source classification, then enriched with local-admin context and UEBA identity context (enabled state, user type, directory roles) before scoring each result with a composite RiskIndicators field.\n\nTABLES: DeviceLogonEvents, IdentityInfo\nCONNECTORS: Microsoft Defender for Endpoint (DeviceLogonEvents), Microsoft Sentinel UEBA (IdentityInfo)\nLICENSE: Microsoft Defender for Endpoint P2 + Microsoft Sentinel; Microsoft Entra ID P2 recommended (UEBA / IdentityInfo enrichment)\n\nTUNING:\n1. DetectionWindow - align to run frequency AND to DeviceLogonEvents ingestion latency\n2. BaselineWindow - history depth for the new-edge / new-source-host baselines\n3. ExcludedHostRegex - AVD / RDS pools, jump hosts, bastions where RDP is normal; default pattern matches nothing, replace to enable, do NOT set it to empty string\n4. ExcludedAccounts - known admin / monitoring / break-glass accounts that RDP broadly\n5. SensitiveRoles - directory roles that set the PrivilegedAccount indicator\n6. Join IdentityInfo on AccountSid instead of name if your IdentityInfo carries the on-prem SID\n\nKNOWN FALSE POSITIVES:\n1. Help desk / admin jump hosts that legitimately RDP to many servers - exclude host or account\n2. AVD / RDS session-host pools where RemoteInteractive is the normal access path - set ExcludedHostRegex\n3. First RDP to a freshly built server during provisioning - baseline clears within 14 days\n4. VPN remote workers arriving from a new public egress IP - triaged by identity context, not suppressed\n\nINVESTIGATION STEPS:\n1. Read RiskIndicators - ExternalSourceIP + LocalAdminLogon + PrivilegedAccount together = immediate escalation.\n2. Confirm the edge: has this Account ever RDP'd to this HostName before, or is IsNewEdge the only signal?\n3. For ExternalSourceIP, geolocate RemoteIP and compare against the user's expected egress / VPN ranges.\n4. For NewSourceHost, identify RemoteDeviceName and confirm it is a sanctioned management origin.\n5. Check IsLocalAdmin and AssignedRoles - privileged RDP to a server is higher risk than a standard user session.\n6. Review AccountType - MachineAccountRDP is unusual and may indicate credential misuse or a misconfiguration.\n7. If IsAccountEnabled is false or UserType is Guest, treat as suspicious regardless of other signals.\n8. Pivot on DeviceId in DeviceLogonEvents and DeviceProcessEvents for follow-on activity after the logon.\n\nBLIND SPOTS:\nOnly covers devices onboarded to Defender for Endpoint; unmanaged hosts produce no DeviceLogonEvents. Does not catch RDP to a host already in the 14-day baseline from a known internal source. Network-level RDP that never completes an interactive logon is not seen. IdentityInfo UEBA columns silently return empty if UEBA is not enabled.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 2.2 | 2026-06-17",
+                "severity": "Medium",
+                "enabled": true,
+                "query": "// =====================================================================\n// Rare RDP Connection - Defender for Endpoint (DeviceLogonEvents)\n// =====================================================================\n// Tables  : DeviceLogonEvents, IdentityInfo\n// License : Microsoft Defender for Endpoint P2 + Microsoft Sentinel\n// Tuning  : see rule description for full tuning notes\n// Author  : Bartosz Wysocki | itprofessor.cloud\n// Version : 2.2 | 2026-06-17\n// =====================================================================\nlet DetectionWindow = 1h;\nlet BaselineWindow = 14d;\nlet IdentityLookback = 30d;\nlet ExcludedHostRegex = @\"\\b\\B\";         // never-matches default (excludes nothing); replace e.g. with \"(?i)(AVD|RDS|JUMP|BASTION)\"\nlet ExcludedAccounts = dynamic([]);      // e.g. [\"svc-monitoring\", \"breakglass\"] matched on SAM name\nlet SensitiveRoles = dynamic([\n\"Global Administrator\",\n\"Privileged Role Administrator\",\n\"Privileged Authentication Administrator\",\n\"Security Administrator\",\n\"Exchange Administrator\",\n\"SharePoint Administrator\",\n\"User Administrator\",\n\"Intune Administrator\",\n\"Application Administrator\",\n\"Hybrid Identity Administrator\",\n\"Domain Admins\",\n\"Enterprise Admins\"\n]);\n// Normalize successful RDP logons from DeviceLogonEvents into one schema\nlet RdpLogons = (windowStart:datetime, windowEnd:datetime) {\n    DeviceLogonEvents\n    | where Timestamp between (windowStart .. windowEnd)\n    | where ActionType == \"LogonSuccess\"\n    | where LogonType == \"RemoteInteractive\"\n    | project\n        Timestamp,\n        DeviceId,\n        DeviceName = toupper(DeviceName),\n        Account = tolower(strcat(AccountDomain, \"\\\\\", AccountName)),\n        AccountName = tolower(AccountName),\n        AccountDomain,\n        AccountSid,\n        RemoteIP,\n        RemoteIPType,\n        RemoteDeviceName = toupper(RemoteDeviceName),\n        Protocol,\n        IsLocalAdmin\n    | extend AccountType = case(\n        AccountName endswith \"$\" or AccountSid in (\"S-1-5-18\", \"S-1-5-19\", \"S-1-5-20\"), \"Machine\",\n        isempty(AccountSid), \"Unknown\",\n        \"User\")\n};\n// 14-day RDP history, materialized once, used to derive both baselines\nlet BaselineRdp = materialize(RdpLogons(ago(BaselineWindow), ago(DetectionWindow)));\nlet BaselineEdges = BaselineRdp | distinct Account, DeviceName | extend SeenEdge = true;\nlet BaselineSourceHosts = BaselineRdp\n    | where isnotempty(RemoteDeviceName)\n    | distinct Account, RemoteDeviceName\n    | extend SeenSourceHost = true;\n// Identity context, keyed on the normalized SAM account name (swap to AccountSid if available)\nlet IdentityContext = IdentityInfo\n    | where TimeGenerated > ago(IdentityLookback)\n    | extend NormalizedAccountName = tolower(trim(\" \", AccountName))\n    | summarize arg_max(TimeGenerated, AccountDisplayName, AccountUPN, IsAccountEnabled, UserType, AssignedRoles, GroupMembership, RiskLevel, RiskState) by NormalizedAccountName;\n// Recent RDP in the detection window\nlet RecentRdp = RdpLogons(ago(DetectionWindow), now())\n    | summarize\n        StartTime = min(Timestamp),\n        EndTime = max(Timestamp),\n        ConnectionCount = count()\n      by Account, AccountName, AccountDomain, AccountSid, AccountType, DeviceId, DeviceName,\n         RemoteIP, RemoteIPType, RemoteDeviceName, Protocol, IsLocalAdmin;\nRecentRdp\n| join kind=leftouter BaselineEdges on Account, DeviceName\n| join kind=leftouter BaselineSourceHosts on Account, RemoteDeviceName\n| extend IsNewEdge = isnull(SeenEdge)\n| extend IsNewSourceHost = isnotempty(RemoteDeviceName) and isnull(SeenSourceHost)\n| extend ExternalSource = RemoteIPType =~ \"Public\"\n| where IsNewEdge or IsNewSourceHost or ExternalSource\n| extend HostName = toupper(tostring(split(DeviceName, \".\")[0]))\n| where not(DeviceName matches regex ExcludedHostRegex)\n| where array_length(ExcludedAccounts) == 0 or AccountName !in~ (ExcludedAccounts)\n| join kind=leftouter IdentityContext on $left.AccountName == $right.NormalizedAccountName\n| extend DomainIndex = toint(indexof(DeviceName, \".\"))\n| extend HostNameDomain = iff(DomainIndex != -1, substring(DeviceName, DomainIndex + 1), DeviceName)\n| extend Risk_1 = iff(IsNewEdge, \"NewRdpEdge\", \"\")\n| extend Risk_2 = iff(IsNewSourceHost, \"NewSourceHost\", \"\")\n| extend Risk_3 = iff(ExternalSource, \"ExternalSourceIP\", \"\")\n| extend Risk_4 = iff(IsLocalAdmin == true, \"LocalAdminLogon\", \"\")\n| extend Risk_5 = iff(tostring(AssignedRoles) has_any (SensitiveRoles), \"PrivilegedAccount\", \"\")\n| extend Risk_6 = iff(IsAccountEnabled == false or UserType =~ \"Guest\", \"DisabledOrGuestAccount\", \"\")\n| extend Risk_7 = iff(AccountType == \"Machine\", \"MachineAccountRDP\", \"\")\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n    iff(isnotempty(Risk_1), strcat(Risk_1, \" | \"), \"\"),\n    iff(isnotempty(Risk_2), strcat(Risk_2, \" | \"), \"\"),\n    iff(isnotempty(Risk_3), strcat(Risk_3, \" | \"), \"\"),\n    iff(isnotempty(Risk_4), strcat(Risk_4, \" | \"), \"\"),\n    iff(isnotempty(Risk_5), strcat(Risk_5, \" | \"), \"\"),\n    iff(isnotempty(Risk_6), strcat(Risk_6, \" | \"), \"\"),\n    iff(isnotempty(Risk_7), strcat(Risk_7, \" | \"), \"\")\n))\n| project\n    StartTime, EndTime, RiskIndicators,\n    Account, AccountName, AccountDomain, AccountType, AccountSid, AccountUPN, AccountDisplayName,\n    DeviceId, DeviceName, HostName, HostNameDomain,\n    RemoteIP, RemoteIPType, RemoteDeviceName,\n    IsNewEdge, IsNewSourceHost, ExternalSource,\n    IsLocalAdmin, Protocol, ConnectionCount,\n    IsAccountEnabled, UserType, AssignedRoles, GroupMembership, RiskLevel, RiskState\n| sort by StartTime desc",
+                "queryFrequency": "PT1H",
+                "queryPeriod": "P14D",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": [
+                    "LateralMovement",
+                    "InitialAccess"
+                ],
+                "techniques": [
+                    "T1021",
+                    "T1133"
+                ],
+                "subTechniques": [
+                    "T1021.001"
+                ],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT5H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": [
+                            "Account"
+                        ],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": null
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "SingleAlert"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "Rare RDP: {{Account}} to {{HostName}} from {{RemoteIP}}",
+                    "alertDescriptionFormat": "Risk flags: {{RiskIndicators}} | Source type: {{RemoteIPType}} | Connections: {{ConnectionCount}}"
+                },
+                "customDetails": {
+                    "RiskIndicators": "RiskIndicators",
+                    "IsNewEdge": "IsNewEdge",
+                    "IsNewSourceHost": "IsNewSourceHost",
+                    "ExternalSource": "ExternalSource",
+                    "IsLocalAdmin": "IsLocalAdmin",
+                    "RemoteIPType": "RemoteIPType",
+                    "ConnectionCount": "ConnectionCount",
+                    "AccountType": "AccountType"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "AccountName"
+                            },
+                            {
+                                "identifier": "NTDomain",
+                                "columnName": "AccountDomain"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "Host",
+                        "fieldMappings": [
+                            {
+                                "identifier": "HostName",
+                                "columnName": "HostName"
+                            },
+                            {
+                                "identifier": "DnsDomain",
+                                "columnName": "HostNameDomain"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "RemoteIP"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}
