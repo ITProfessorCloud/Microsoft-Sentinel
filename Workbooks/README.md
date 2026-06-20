@@ -52,3 +52,6 @@ Eight tabs covering Identity & Profile, Access Footprint, Activity Trail, Data &
 More workbooks will be added over time. Check back or watch the repo for updates.
 
 For more content, tutorials, and free resources: **https://www.itprofessor.cloud/**
+
+
+[![Deploy to Azure](https://aka.ms/deploytoazure)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FITProfessorCloud%2FMicrosoft-Sentinel%2Fmain%2FWorkbooks%2FUser-Audit-Investigation%2Fazuredeploy.json)
