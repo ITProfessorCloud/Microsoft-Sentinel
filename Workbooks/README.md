@@ -47,7 +47,27 @@ Eight tabs covering Identity & Profile, Access Footprint, Activity Trail, Data &
 - Start with a short range (7d / 14d). Going 90d on a noisy tenant will just DDoS your own eyeballs.
 - If a query returns nothing, check ingestion and table availability before touching the KQL.
 
+  ---
+
+### 🏝️ Forsaken Resources
+
+An Azure governance workbook that helps you find the forgotten, abandoned, and neglected resources quietly cluttering your environment. Built on Azure Resource Graph, it surfaces orphaned disks, unused public IPs, unattached NICs, empty resource groups, abandoned networking components, and other resources that are either costing money, increasing operational complexity, or waiting to cause confusion during an outage.
+
+Instead of hunting through subscriptions manually, you get a centralised view of resources that probably should not exist anymore, helping you reduce waste, improve governance, and clean up your Azure estate before the next cost review or security audit.
+
+**📖 Blog Guide:** https://www.itprofessor.cloud/azure-forsaken-resources-workbook/
+
+**📄 File:** [Forsaken Resources.json](./Forsaken%20Resources/Forsaken%20Resources.json)
+
+**Before you deploy:**
+- The workbook uses Azure Resource Graph, so users need permissions to query the subscriptions they want to assess.
+- Finding a resource here does not automatically mean it is safe to delete. Always validate ownership and dependencies first.
+- Larger environments may return significant numbers of results. Start with a limited subscription scope if you're using it for the first time.
+
 ---
+
+---
+
 
 More workbooks will be added over time. Check back or watch the repo for updates.
 
