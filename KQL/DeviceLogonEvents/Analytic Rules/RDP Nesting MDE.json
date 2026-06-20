@@ -1,0 +1,120 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/rdp-nesting-defender-endpoint')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/rdp-nesting-defender-endpoint')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "RDP Nesting - Defender for Endpoint (DeviceLogonEvents)",
+                "description": "Detects RDP nesting (lateral movement chains) by linking an inbound RemoteInteractive logon to a pivot host with an onward RemoteInteractive logon from that same host, by the same account, within a configurable time window. Hops are correlated on short hostname (RemoteDeviceName) so no IP resolution is needed. Established pivot paths are suppressed via a 14-day per-account baseline, and each surviving chain is enriched with UEBA identity context and scored with a composite RiskIndicators field flagging new nested edges, external origins, local-admin landings, privileged accounts, and machine-account use.\n\nTABLES: DeviceLogonEvents, IdentityInfo\nCONNECTORS: Microsoft Defender for Endpoint (DeviceLogonEvents), Microsoft Sentinel UEBA (IdentityInfo)\nLICENSE: Microsoft Defender for Endpoint P2 + Microsoft Sentinel; Microsoft Entra ID P2 recommended (UEBA / IdentityInfo enrichment)\n\nTUNING:\n1. DetectionWindow - how recent the onward hop must be; one alert per onward hop\n2. HopWindow - max gap allowed between the inbound hop and the onward hop\n3. BaselineWindow - history depth for suppressing established pivot paths\n4. EstablishedHopThreshold - suppress B->C pivots this account has done >= N times in the baseline\n5. ExcludedHostRegex - sanctioned jump hosts / bastions / AVD pools; default pattern matches nothing, replace to enable, do NOT set to empty string\n6. ExcludedAccounts - service / monitoring accounts that pivot by design\n7. SensitiveRoles - directory roles that set the PrivilegedAccount indicator\n\nKNOWN FALSE POSITIVES:\n1. Admins hopping through a sanctioned jump host - exclude the host or raise EstablishedHopThreshold\n2. Established daily pivot paths - cleared by the baseline suppression\n3. Newly built or re-imaged pivot hosts - baseline clears within 14 days\n\nINVESTIGATION STEPS:\n1. Read RiskIndicators - ExternalOrigin + NewNestedEdge + LocalAdminOnTarget together = immediate escalation.\n2. Establish the chain: OriginHost/OriginIP -> PivotHost -> TargetC, confirm each hop is expected for this account.\n3. For ExternalOrigin, geolocate OriginIP and compare to the user's known egress / VPN ranges.\n4. Check PivotHopCount - zero means this account has never used this exact B->C pivot in the baseline.\n5. Review OnwardIsLocalAdmin and AssignedRoles - privileged onward landing is materially higher risk.\n6. Confirm AccountType - MachineAccountRDP across a chain is highly unusual and may indicate credential theft.\n7. If IsAccountEnabled is false or UserType is Guest, treat the whole chain as suspicious.\n8. Pivot on TargetCDeviceId in DeviceProcessEvents / DeviceNetworkEvents for follow-on actions on the onward target.\n\nBLIND SPOTS:\nOnly covers devices onboarded to Defender for Endpoint; an unmanaged pivot host breaks the chain. Correlates on hostname, so hops where RemoteDeviceName is blank cannot be linked. Pivots slower than HopWindow are missed. Does not catch non-RDP lateral movement (WinRM, SMB, SSH). IdentityInfo UEBA columns silently return empty if UEBA is not enabled.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 1.0 | 2026-06-17",
+                "severity": "High",
+                "enabled": true,
+                "query": "// =====================================================================\n// RDP Nesting - Defender for Endpoint (DeviceLogonEvents)\n// =====================================================================\n// Tables  : DeviceLogonEvents, IdentityInfo\n// License : Microsoft Defender for Endpoint P2 + Microsoft Sentinel\n// Tuning  : see rule description for full tuning notes\n// Author  : Bartosz Wysocki | itprofessor.cloud\n// Version : 1.0 | 2026-06-17\n// =====================================================================\nlet DetectionWindow = 1h;            // the onward hop must land within this window\nlet HopWindow = 60m;                 // max gap between the inbound hop and the onward hop\nlet BaselineWindow = 14d;            // history for suppressing established pivot paths\nlet IdentityLookback = 30d;\nlet EstablishedHopThreshold = 5;     // B->C pivots this account has done >= N times in the baseline are treated as routine\nlet ExcludedHostRegex = @\"\\b\\B\";     // never-matches default (excludes nothing); replace e.g. with \"(?i)(AVD|RDS|JUMP|BASTION)\"\nlet ExcludedAccounts = dynamic([]);  // e.g. [\"svc-monitoring\", \"breakglass\"] matched on SAM name\nlet SensitiveRoles = dynamic([\n\"Global Administrator\",\n\"Privileged Role Administrator\",\n\"Privileged Authentication Administrator\",\n\"Security Administrator\",\n\"Exchange Administrator\",\n\"SharePoint Administrator\",\n\"User Administrator\",\n\"Intune Administrator\",\n\"Application Administrator\",\n\"Hybrid Identity Administrator\",\n\"Domain Admins\",\n\"Enterprise Admins\"\n]);\n// Normalize successful RDP logons; short host names so FQDN and NetBIOS forms join cleanly\nlet RdpLogons = (windowStart:datetime, windowEnd:datetime) {\n    DeviceLogonEvents\n    | where Timestamp between (windowStart .. windowEnd)\n    | where ActionType == \"LogonSuccess\"\n    | where LogonType == \"RemoteInteractive\"\n    | extend\n        TargetHost = toupper(tostring(split(DeviceName, \".\")[0])),        // host the logon landed on\n        SourceHost = toupper(tostring(split(RemoteDeviceName, \".\")[0])),  // host the connection came from\n        Account = tolower(strcat(AccountDomain, \"\\\\\", AccountName)),\n        AccountName = tolower(AccountName)\n    | project Timestamp, DeviceId, DeviceName = toupper(DeviceName), TargetHost, SourceHost,\n              RemoteIP, RemoteIPType, Account, AccountName, AccountDomain, AccountSid, IsLocalAdmin\n    | extend AccountType = case(\n        AccountName endswith \"$\" or AccountSid in (\"S-1-5-18\", \"S-1-5-19\", \"S-1-5-20\"), \"Machine\",\n        isempty(AccountSid), \"Unknown\",\n        \"User\")\n};\n// All RDP hops across the correlation window (onward hop window + the hop gap before it)\nlet Hops = materialize(RdpLogons(ago(DetectionWindow + HopWindow), now()));\n// Onward hop B -> C: recent, with a known pivot host (B = SourceHost)\nlet OnwardHops = Hops\n    | where Timestamp > ago(DetectionWindow)\n    | where isnotempty(SourceHost)\n    | project\n        OnwardTime = Timestamp, TargetC = DeviceName, TargetCHost = TargetHost, PivotHost = SourceHost,\n        OnwardRemoteIP = RemoteIP, OnwardRemoteIPType = RemoteIPType, OnwardIsLocalAdmin = IsLocalAdmin,\n        TargetCDeviceId = DeviceId, Account, AccountName, AccountDomain, AccountSid, AccountType;\n// Inbound hop ? -> B: any source (the origin may be external, which is itself interesting)\nlet InboundHops = Hops\n    | project InboundTime = Timestamp, PivotTargetHost = TargetHost, OriginHost = SourceHost,\n              OriginIP = RemoteIP, OriginIPType = RemoteIPType, Account;\n// Established B -> C pivots for this account over the baseline (routine jump-host paths)\nlet EstablishedPivots = RdpLogons(ago(BaselineWindow), ago(DetectionWindow))\n    | where isnotempty(SourceHost)\n    | summarize PivotHopCount = count() by Account, PivotHost = SourceHost, TargetCHost = TargetHost;\n// Identity context, keyed on the normalized SAM account name\nlet IdentityContext = IdentityInfo\n    | where TimeGenerated > ago(IdentityLookback)\n    | extend NormalizedAccountName = tolower(trim(\" \", AccountName))\n    | summarize arg_max(TimeGenerated, AccountDisplayName, AccountUPN, IsAccountEnabled, UserType, AssignedRoles, GroupMembership, RiskLevel, RiskState) by NormalizedAccountName;\nOnwardHops\n| join kind=inner InboundHops on Account\n| where PivotTargetHost == PivotHost                 // the pivot (B) is the target of the inbound hop\n| where TargetCHost != PivotHost                     // the onward target (C) is a different host\n| where InboundTime < OnwardTime and OnwardTime <= InboundTime + HopWindow\n| summarize\n    OnwardFirstSeen = min(OnwardTime),\n    OnwardLastSeen = max(OnwardTime),\n    ChainCount = count(),\n    arg_max(InboundTime, OriginHost, OriginIP, OriginIPType)\n  by Account, AccountName, AccountDomain, AccountSid, AccountType,\n     PivotHost, TargetC, TargetCHost, OnwardRemoteIP, OnwardRemoteIPType, OnwardIsLocalAdmin, TargetCDeviceId\n| join kind=leftouter EstablishedPivots on Account, PivotHost, TargetCHost\n| extend PivotHopCount = coalesce(PivotHopCount, 0)\n| where PivotHopCount < EstablishedHopThreshold\n| where not(PivotHost matches regex ExcludedHostRegex) and not(TargetCHost matches regex ExcludedHostRegex)\n| where array_length(ExcludedAccounts) == 0 or AccountName !in~ (ExcludedAccounts)\n| join kind=leftouter IdentityContext on $left.AccountName == $right.NormalizedAccountName\n| extend Risk_1 = iff(PivotHopCount == 0, \"NewNestedEdge\", \"\")\n| extend Risk_2 = iff(OriginIPType =~ \"Public\", \"ExternalOrigin\", \"\")\n| extend Risk_3 = iff(OnwardIsLocalAdmin == true, \"LocalAdminOnTarget\", \"\")\n| extend Risk_4 = iff(tostring(AssignedRoles) has_any (SensitiveRoles), \"PrivilegedAccount\", \"\")\n| extend Risk_5 = iff(IsAccountEnabled == false or UserType =~ \"Guest\", \"DisabledOrGuestAccount\", \"\")\n| extend Risk_6 = iff(AccountType == \"Machine\", \"MachineAccountRDP\", \"\")\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n    iff(isnotempty(Risk_1), strcat(Risk_1, \" | \"), \"\"),\n    iff(isnotempty(Risk_2), strcat(Risk_2, \" | \"), \"\"),\n    iff(isnotempty(Risk_3), strcat(Risk_3, \" | \"), \"\"),\n    iff(isnotempty(Risk_4), strcat(Risk_4, \" | \"), \"\"),\n    iff(isnotempty(Risk_5), strcat(Risk_5, \" | \"), \"\"),\n    iff(isnotempty(Risk_6), strcat(Risk_6, \" | \"), \"\")\n))\n| project\n    OnwardFirstSeen, OnwardLastSeen, RiskIndicators,\n    Account, AccountName, AccountDomain, AccountType, AccountSid, AccountUPN, AccountDisplayName,\n    OriginHost, OriginIP, OriginIPType, InboundTime,\n    PivotHost,\n    TargetC, TargetCHost, TargetCDeviceId, OnwardRemoteIP, OnwardRemoteIPType, OnwardIsLocalAdmin,\n    ChainCount, PivotHopCount,\n    IsAccountEnabled, UserType, AssignedRoles, GroupMembership, RiskLevel, RiskState\n| sort by OnwardLastSeen desc",
+                "queryFrequency": "PT1H",
+                "queryPeriod": "P14D",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": [
+                    "LateralMovement",
+                    "InitialAccess"
+                ],
+                "techniques": [
+                    "T1021",
+                    "T1133"
+                ],
+                "subTechniques": [
+                    "T1021.001"
+                ],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT5H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": [
+                            "Account"
+                        ],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": null
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "SingleAlert"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "RDP Nesting: {{Account}} pivoted via {{PivotHost}} to {{TargetCHost}}",
+                    "alertDescriptionFormat": "Risk flags: {{RiskIndicators}} | Origin: {{OriginHost}} | Onward target: {{TargetC}}"
+                },
+                "customDetails": {
+                    "RiskIndicators": "RiskIndicators",
+                    "PivotHost": "PivotHost",
+                    "TargetCHost": "TargetCHost",
+                    "OriginHost": "OriginHost",
+                    "OriginIPType": "OriginIPType",
+                    "ChainCount": "ChainCount",
+                    "PivotHopCount": "PivotHopCount",
+                    "OnwardIsLocalAdmin": "OnwardIsLocalAdmin",
+                    "AccountType": "AccountType"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "AccountName"
+                            },
+                            {
+                                "identifier": "NTDomain",
+                                "columnName": "AccountDomain"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "Host",
+                        "fieldMappings": [
+                            {
+                                "identifier": "HostName",
+                                "columnName": "PivotHost"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "Host",
+                        "fieldMappings": [
+                            {
+                                "identifier": "HostName",
+                                "columnName": "TargetCHost"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "OriginIP"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}
