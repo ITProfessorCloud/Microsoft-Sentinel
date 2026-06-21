@@ -57,7 +57,7 @@ Instead of hunting through subscriptions manually, you get a centralised view of
 
 **📖 Blog Guide:** https://www.itprofessor.cloud/azure-forsaken-resources-workbook/
 
-**📄 File:** [Forsaken Resources.json](./Forsaken%20Resources/Forsaken%20Resources.json)
+**📄 File:** [Forsaken Resources.json](./Forsaken-Resources/Forsaken-Resources.json)
 
 **Before you deploy:**
 - The workbook uses Azure Resource Graph, so users need permissions to query the subscriptions they want to assess.
