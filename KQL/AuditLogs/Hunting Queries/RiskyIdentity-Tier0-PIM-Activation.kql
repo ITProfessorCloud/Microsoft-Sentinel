@@ -1,0 +1,120 @@
+// =====================================================================
+// Risky Identity Activating a Tier-0 PIM Role
+// =====================================================================
+// Description : Detects a PIM activation into a Tier-0 Entra ID role by an identity that
+//               currently carries an active Microsoft Entra ID Protection risk state.
+//               Inner-joins activations to risky users, enriches with IdentityInfo, and
+//               scores the event from role value plus risk severity. This is the
+//               highest-fidelity rule in the set: a risky account self-elevating is a
+//               near-textbook account-takeover-into-privilege signal.
+// Type        : Detection (Scheduled)
+//
+// Tables      : AuditLogs, AADRiskyUsers, IdentityInfo
+// Connectors  : Microsoft Entra ID (AuditLogs), Microsoft Entra ID Protection (AADRiskyUsers),
+//               Microsoft Sentinel UEBA (IdentityInfo)
+// License     : Microsoft Sentinel + Microsoft Entra ID P2 (Identity Protection / UEBA)
+//
+// Tuning      : - Tier0Roles / Tier0RoleWeight - the roles that arm the rule and their scores
+//               - DetectionWindow / RiskLookback - detection and risk baseline windows
+//               - ExcludedActorRegex - break-glass / approved automation UPNs to suppress
+//               - MinScore - final score gate; raise to cut volume
+//
+// Known FPs   : - Break-glass activation during a genuine incident - exclude via ExcludedActorRegex
+//               - Stale risk not dismissed after remediation - confirm RiskLastUpdatedDateTime freshness
+//               - If RoleName returns empty in your tenant, the role sits in modifiedProperties
+//                 (Role.DisplayName) rather than a Role-typed TargetResource; swap the parser block
+//
+// Author      : Bartosz Wysocki | https://www.itprofessor.cloud
+// Version     : 1.0 | 2026-06-21
+// =====================================================================
+let DetectionWindow = 1h;
+let RiskLookback = 7d;
+let ExcludedActorRegex = @"\b\B";   // never-matches by default; add break-glass UPNs e.g. @"(?i)(brk-glass|emergency)@contoso\.com"
+let MinScore = 80;
+let Tier0Roles = dynamic([
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "Privileged Authentication Administrator",
+    "Security Administrator",
+    "Application Administrator",
+    "Cloud Application Administrator"
+]);
+let Tier0RoleWeight = datatable(RoleName:string, RoleScore:int)
+[
+    "Global Administrator", 100,
+    "Privileged Role Administrator", 90,
+    "Privileged Authentication Administrator", 85,
+    "Security Administrator", 80,
+    "Application Administrator", 50,
+    "Cloud Application Administrator", 50
+];
+// Latest risk state per identity, de-duplicated and weighted
+let RiskyUsers = materialize(
+    AADRiskyUsers
+    | where TimeGenerated > ago(RiskLookback)
+    | summarize arg_max(RiskLastUpdatedDateTime, RiskLevel, RiskState) by UserPrincipalName
+    | where RiskState in ("atRisk", "confirmedCompromised")
+    | extend RiskWeight = case(
+        RiskLevel == "high"   and RiskState == "confirmedCompromised", 100,
+        RiskLevel == "high",                                            80,
+        RiskLevel == "medium" and RiskState == "confirmedCompromised",  70,
+        RiskLevel == "medium",                                          50,
+        30)
+    | project RiskyUPN = UserPrincipalName, RiskLevel, RiskState, RiskLastUpdatedDateTime, RiskWeight
+);
+// Identity context for enrichment
+let IdentityContext =
+    IdentityInfo
+    | where TimeGenerated > ago(14d)
+    | summarize arg_max(TimeGenerated, Department, JobTitle, Manager, IsMFARegistered, IsAccountEnabled, IsServiceAccount, EntityRiskScore) by AccountUPN;
+// Reusable Tier-0 PIM activation parser
+let PIMTier0Activations = (start:datetime, end:datetime) {
+    AuditLogs
+    | where TimeGenerated between (start .. end)
+    | where Category =~ "RoleManagement"
+    | where OperationName == "Add member to role completed (PIM activation)"
+    | where ResultType =~ "success" or Result =~ "success"
+    | extend Actor = tostring(InitiatedBy.user.userPrincipalName)
+    | extend ActorId = tostring(InitiatedBy.user.id)
+    | extend ActorIPInline = tostring(InitiatedBy.user.ipAddress)
+    | where isnotempty(Actor)
+    | where not(Actor matches regex ExcludedActorRegex)
+    | mv-apply TR = TargetResources on (
+        where tostring(TR.type) =~ "Role"
+        | extend RoleName = tostring(TR.displayName)
+        | where isnotempty(RoleName)
+    )
+    | where RoleName in (Tier0Roles)
+    | mv-apply D = AdditionalDetails on (
+        summarize ActorIPDetail = take_anyif(tostring(D.value), tostring(D.key) == "ipaddr")
+    )
+    | extend ActorIP = coalesce(ActorIPDetail, ActorIPInline)
+};
+PIMTier0Activations(ago(DetectionWindow), now())
+| join kind=inner RiskyUsers on $left.Actor == $right.RiskyUPN
+| lookup kind=leftouter Tier0RoleWeight on RoleName
+| join kind=leftouter IdentityContext on $left.Actor == $right.AccountUPN
+| extend RoleScore = coalesce(RoleScore, 50)
+| extend AlertScore = RoleScore + RiskWeight
+| where AlertScore >= MinScore
+| extend ActorName      = tostring(split(Actor, "@", 0)[0])
+| extend ActorUPNSuffix = tostring(split(Actor, "@", 1)[0])
+| extend Risk_1 = iff(RiskState == "confirmedCompromised", "ActorConfirmedCompromised", "")
+| extend Risk_2 = iff(RoleScore >= 90, "CriticalTier0Role", "")
+| extend Risk_3 = iff(IsMFARegistered == false, "ActorMFANotRegistered", "")
+| extend Risk_4 = iff(IsServiceAccount == true, "ActorIsServiceAccount", "")
+| extend Risk_5 = iff(isempty(ActorIP), "NoIPAddressLogged", "")
+| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
+    iff(isnotempty(Risk_1), strcat(Risk_1, " | "), ""),
+    iff(isnotempty(Risk_2), strcat(Risk_2, " | "), ""),
+    iff(isnotempty(Risk_3), strcat(Risk_3, " | "), ""),
+    iff(isnotempty(Risk_4), strcat(Risk_4, " | "), ""),
+    iff(isnotempty(Risk_5), strcat(Risk_5, " | "), "")
+))
+| project
+    TimeGenerated, Actor, ActorName, ActorUPNSuffix, ActorId, ActorIP,
+    RoleName, RoleScore, RiskLevel, RiskState, RiskWeight, AlertScore,
+    RiskLastUpdatedDateTime, Department, JobTitle, Manager,
+    IsMFARegistered, IsServiceAccount, IsAccountEnabled, EntityRiskScore,
+    RiskIndicators, CorrelationId
+| sort by AlertScore desc, TimeGenerated desc

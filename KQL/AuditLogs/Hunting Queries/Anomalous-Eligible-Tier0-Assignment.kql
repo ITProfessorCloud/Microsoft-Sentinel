@@ -1,0 +1,149 @@
+// =====================================================================
+// Anomalous Eligible Tier-0 Role Assignment (New / Non-Privileged Assignor)
+// =====================================================================
+// Description : Detects an eligible Tier-0 PIM assignment granted by an assignor who is
+//               new to assigning that role (14-day anti-join on the assignor/role pair) or
+//               who has no privileged-assignment history at all. Recovers the human behind
+//               MS-PIM, enriches assignor and target from IdentityInfo, and scores the
+//               grant from role value, assignor novelty, and assignor risk. Catches the
+//               persistence step where an attacker hands themselves or a burner standing
+//               eligibility rather than activating an existing role.
+// Type        : Detection (Scheduled)
+//
+// Tables      : AuditLogs, AADRiskyUsers, IdentityInfo
+// Connectors  : Microsoft Entra ID (AuditLogs), Microsoft Entra ID Protection (AADRiskyUsers),
+//               Microsoft Sentinel UEBA (IdentityInfo)
+// License     : Microsoft Sentinel + Microsoft Entra ID P2 (Identity Protection / UEBA)
+//
+// Tuning      : - Tier0Roles / Tier0RoleWeight - roles that arm the rule and their scores
+//               - BaselineWindow - history used to learn known assignor/role pairs (default 14d)
+//               - ExcludedActorRegex - approved IAM / provisioning UPNs to suppress
+//               - MinScore - final score gate
+//
+// Known FPs   : - IAM or IT onboarding a new approver - clears from baseline after 14 days
+//               - Provisioning / HR-sync service principals - exclude via ExcludedActorRegex
+//               - First run after deployment will alert on every assignor until baseline fills
+//
+// Author      : Bartosz Wysocki | https://www.itprofessor.cloud
+// Version     : 1.0 | 2026-06-21
+// =====================================================================
+let DetectionWindow = 1h;
+let BaselineWindow = 14d;
+let ExcludedActorRegex = @"\b\B";
+let MinScore = 70;
+let Tier0Roles = dynamic([
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "Privileged Authentication Administrator",
+    "Security Administrator",
+    "Application Administrator",
+    "Cloud Application Administrator"
+]);
+let Tier0RoleWeight = datatable(RoleName:string, RoleScore:int)
+[
+    "Global Administrator", 100,
+    "Privileged Role Administrator", 90,
+    "Privileged Authentication Administrator", 85,
+    "Security Administrator", 80,
+    "Application Administrator", 50,
+    "Cloud Application Administrator", 50
+];
+// Reusable parser: successful eligible Tier-0 PIM assignments, with assignor and target
+let EligibleTier0Assignments = (start:datetime, end:datetime) {
+    AuditLogs
+    | where TimeGenerated between (start .. end)
+    | where Category =~ "RoleManagement"
+    | where OperationName has "Add eligible member to role" and OperationName has "completed"
+    | where ResultType =~ "success" or Result =~ "success"
+    | extend Assignor   = tostring(InitiatedBy.user.userPrincipalName)
+    | extend AssignorApp = tostring(InitiatedBy.app.displayName)
+    | mv-apply TR = TargetResources on (
+        where tostring(TR.type) =~ "Role"
+        | extend RoleName = tostring(TR.displayName)
+        | where isnotempty(RoleName)
+    )
+    | where RoleName in (Tier0Roles)
+    | mv-apply TU = TargetResources on (
+        where tostring(TU.type) =~ "User"
+        | extend TargetUser = tostring(TU.userPrincipalName)
+    )
+};
+// Recover the real requester behind MS-PIM initiated grants
+let PimRequesters = materialize(
+    AuditLogs
+    | where TimeGenerated > ago(2h)
+    | where Category =~ "RoleManagement"
+    | where OperationName has "PIM" and OperationName has "request"
+    | extend RequestedBy = tostring(InitiatedBy.user.userPrincipalName)
+    | where isnotempty(RequestedBy) and isnotempty(CorrelationId)
+    | distinct CorrelationId, RequestedBy
+);
+// Known assignor/role pairs over the baseline (anti-join target)
+let KnownAssignorPairs = materialize(
+    EligibleTier0Assignments(ago(BaselineWindow), ago(DetectionWindow))
+    | distinct Assignor, RoleName
+);
+// Assignors with any Tier-0 PIM history over the baseline
+let PrivilegedAssignors = materialize(
+    EligibleTier0Assignments(ago(BaselineWindow), ago(DetectionWindow))
+    | summarize HistoricalAssignments = count() by Assignor
+    | extend HasHistory = 1
+);
+let RiskyUsers = materialize(
+    AADRiskyUsers
+    | where TimeGenerated > ago(7d)
+    | summarize arg_max(RiskLastUpdatedDateTime, RiskLevel, RiskState) by UserPrincipalName
+    | where RiskState in ("atRisk", "confirmedCompromised")
+    | extend RiskWeight = case(
+        RiskLevel == "high"   and RiskState == "confirmedCompromised", 100,
+        RiskLevel == "high",                                            80,
+        RiskLevel == "medium" and RiskState == "confirmedCompromised",  70,
+        RiskLevel == "medium",                                          50,
+        30)
+    | project RiskyUPN = UserPrincipalName, RiskLevel, RiskState, RiskWeight
+);
+let IdentityContext =
+    IdentityInfo
+    | where TimeGenerated > ago(BaselineWindow)
+    | summarize arg_max(TimeGenerated, AccountCreationTime, Department, JobTitle, Manager, IsMFARegistered, IsServiceAccount, IsAccountEnabled) by AccountUPN;
+EligibleTier0Assignments(ago(DetectionWindow), now())
+| join kind=leftouter PimRequesters on CorrelationId
+| extend Assignor = iff((Assignor == "" or Assignor in ("MS-PIM", "MS-PIM-Fairfax")) and isnotempty(RequestedBy), RequestedBy, Assignor)
+| where isnotempty(Assignor)
+| where not(Assignor matches regex ExcludedActorRegex)
+| join kind=leftanti KnownAssignorPairs on Assignor, RoleName
+| lookup kind=leftouter PrivilegedAssignors on Assignor
+| lookup kind=leftouter Tier0RoleWeight on RoleName
+| join kind=leftouter RiskyUsers on $left.Assignor == $right.RiskyUPN
+| join kind=leftouter IdentityContext on $left.Assignor == $right.AccountUPN
+| extend HasHistory = coalesce(HasHistory, 0)
+| extend RiskWeight = coalesce(RiskWeight, 0)
+| extend RoleScore  = coalesce(RoleScore, 50)
+| extend FirstTimeAssignor = HasHistory == 0
+| extend NoveltyWeight = iff(FirstTimeAssignor, 40, 20)   // never assigned vs new for this role
+| extend AssignorAgeDays = datetime_diff('day', now(), AccountCreationTime)
+| extend AlertScore = RoleScore + NoveltyWeight + RiskWeight
+| where AlertScore >= MinScore
+| extend AssignorName      = tostring(split(Assignor, "@", 0)[0])
+| extend AssignorUPNSuffix = tostring(split(Assignor, "@", 1)[0])
+| extend TargetName        = tostring(split(TargetUser, "@", 0)[0])
+| extend TargetUPNSuffix   = tostring(split(TargetUser, "@", 1)[0])
+| extend Risk_1 = iff(RoleScore >= 90, "CriticalTier0Role", "")
+| extend Risk_2 = iff(FirstTimeAssignor, "FirstTimeAssignor", "NewAssignorForRole")
+| extend Risk_3 = iff(RiskWeight > 0, "AssignorAtRisk", "")
+| extend Risk_4 = iff(AssignorAgeDays < 7, "AssignorRecentlyCreated", "")
+| extend Risk_5 = iff(IsMFARegistered == false, "AssignorMFANotRegistered", "")
+| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
+    iff(isnotempty(Risk_1), strcat(Risk_1, " | "), ""),
+    iff(isnotempty(Risk_2), strcat(Risk_2, " | "), ""),
+    iff(isnotempty(Risk_3), strcat(Risk_3, " | "), ""),
+    iff(isnotempty(Risk_4), strcat(Risk_4, " | "), ""),
+    iff(isnotempty(Risk_5), strcat(Risk_5, " | "), "")
+))
+| project
+    TimeGenerated, Assignor, AssignorName, AssignorUPNSuffix,
+    TargetUser, TargetName, TargetUPNSuffix, RoleName, RoleScore,
+    FirstTimeAssignor, NoveltyWeight, RiskLevel, RiskState, RiskWeight,
+    AlertScore, AssignorAgeDays, Department, JobTitle, Manager,
+    IsMFARegistered, IsServiceAccount, RiskIndicators, CorrelationId
+| sort by AlertScore desc, TimeGenerated desc

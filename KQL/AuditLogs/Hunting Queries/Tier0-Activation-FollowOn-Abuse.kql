@@ -1,0 +1,160 @@
+// =====================================================================
+// Tier-0 PIM Activation Followed by High-Impact Directory Changes
+// =====================================================================
+// Description : Detects a Tier-0 PIM activation that is followed, within the activation
+//               window, by sensitive directory operations performed by the same identity,
+//               and flags whether the activation came from an unseen sign-in country.
+//               PIM activation is expected; using it to immediately create accounts, grant
+//               app secrets, or weaken Conditional Access is not. Scores from follow-on
+//               severity, geo novelty, and active Identity Protection risk.
+// Type        : Detection (Scheduled)
+//
+// Tables      : AuditLogs, SigninLogs, AADRiskyUsers
+// Connectors  : Microsoft Entra ID (AuditLogs, SigninLogs),
+//               Microsoft Entra ID Protection (AADRiskyUsers)
+// License     : Microsoft Sentinel + Microsoft Entra ID P2 (Identity Protection)
+//
+// Tuning      : - Tier0Roles - roles whose activation is in scope
+//               - DetectionWindow - how far back to look for activations (default 1h)
+//               - ActOpWindow - window after activation in which follow-on ops count (default 1h)
+//               - SensitiveOps - operations that earn the top follow-on weight
+//               - BaselineWindow - sign-in history used to learn known countries (default 14d,
+//                 capped at the 14-day scheduled-rule ceiling; precompute to a watchlist if you
+//                 want a longer geo baseline)
+//               - MinScore - final score gate
+//
+// Known FPs   : - Genuine admin work performed under a legitimate activation - validate the
+//                 follow-on operation set and the originating IP / country
+//               - Travelling admins triggering NewSignInCountry - corroborate with the
+//                 follow-on weight and risk before escalating
+//
+// Note on joins: SigninLogs joins on UserId (the object ID), NOT Identity (a display name).
+//                Location is already a 2-letter country code, so it is compared directly.
+//
+// Author      : Bartosz Wysocki | https://www.itprofessor.cloud
+// Version     : 1.0 | 2026-06-21
+// =====================================================================
+let DetectionWindow = 1h;
+let ActOpWindow = 1h;
+let BaselineWindow = 14d;   // scheduled-rule query period maxes at 14 days
+let MinScore = 5;
+let Tier0Roles = dynamic([
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "Privileged Authentication Administrator",
+    "Security Administrator",
+    "Application Administrator",
+    "Cloud Application Administrator"
+]);
+let SensitiveOps = dynamic([
+    "Add user",
+    "Add member to role",
+    "Update conditional access policy",
+    "Delete conditional access policy",
+    "Add application",
+    "Add service principal",
+    "Add service principal credentials",
+    "Update application - Certificates and secrets management",
+    "Add app role assignment to service principal",
+    "Set federation settings on domain",
+    "Update domain"
+]);
+// Tier-0 activations in the detection window
+let Tier0Activations =
+    AuditLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where Category =~ "RoleManagement"
+    | where OperationName == "Add member to role completed (PIM activation)"
+    | where ResultType =~ "success" or Result =~ "success"
+    | extend Actor   = tostring(InitiatedBy.user.userPrincipalName)
+    | extend ActorId = tostring(InitiatedBy.user.id)
+    | extend ActorIPInline = tostring(InitiatedBy.user.ipAddress)
+    | where isnotempty(Actor)
+    | mv-apply TR = TargetResources on (
+        where tostring(TR.type) =~ "Role"
+        | extend RoleName = tostring(TR.displayName)
+        | where isnotempty(RoleName)
+    )
+    | where RoleName in (Tier0Roles)
+    | mv-apply D = AdditionalDetails on (
+        summarize ActorIPDetail = take_anyif(tostring(D.value), tostring(D.key) == "ipaddr")
+    )
+    | extend ActorIP = coalesce(ActorIPDetail, ActorIPInline)
+    | project ActivationTime = TimeGenerated, Actor, ActorId, ActorIP, RoleName,
+              ActivationCorrelationId = CorrelationId;
+// Candidate follow-on directory operations by the same actors
+let FollowOnOps =
+    AuditLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where OperationName != "Add member to role completed (PIM activation)"
+    | extend FollowActor = tostring(InitiatedBy.user.userPrincipalName)
+    | where isnotempty(FollowActor)
+    | extend OpWeight = case(
+        OperationName in (SensitiveOps),                        3,
+        OperationName has_any ("Delete", "Remove"),             2,
+        OperationName has_any ("Update", "Create", "Add", "Set"), 2,
+        1)
+    | project FollowTime = TimeGenerated, FollowActor, FollowOp = OperationName, OpWeight;
+// 30-day known-country baseline per identity (object ID), excluding the last day
+let CountryBaseline = materialize(
+    SigninLogs
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(1d))
+    | where ResultType == "0"
+    | where isnotempty(Location)
+    | summarize KnownCountries = make_set(Location, 200) by ActorId = UserId
+);
+// Sign-in country at activation time (most recent successful sign-in in the window)
+let RecentCountry =
+    SigninLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where ResultType == "0"
+    | where isnotempty(Location)
+    | summarize arg_max(TimeGenerated, Location) by ActorId = UserId
+    | project ActorId, SignInCountry = Location;
+let RiskyUsers = materialize(
+    AADRiskyUsers
+    | where TimeGenerated > ago(7d)
+    | summarize arg_max(RiskLastUpdatedDateTime, RiskLevel, RiskState) by UserPrincipalName
+    | where RiskState in ("atRisk", "confirmedCompromised")
+    | extend RiskWeight = case(
+        RiskState == "confirmedCompromised", 4,
+        RiskLevel == "high",                 3,
+        2)
+    | project RiskyUPN = UserPrincipalName, RiskLevel, RiskState, RiskWeight
+);
+Tier0Activations
+| join kind=inner FollowOnOps on $left.Actor == $right.FollowActor
+| where FollowTime between (ActivationTime .. ActivationTime + ActOpWindow)
+| summarize
+    FollowOnOps   = make_set(FollowOp, 15),
+    FollowOnCount = count(),
+    MaxOpWeight   = max(OpWeight),
+    FirstFollowOn = min(FollowTime)
+    by ActivationTime, Actor, ActorId, ActorIP, RoleName, ActivationCorrelationId
+| join kind=leftouter RecentCountry on ActorId
+| join kind=leftouter CountryBaseline on ActorId
+| join kind=leftouter RiskyUsers on $left.Actor == $right.RiskyUPN
+| extend RiskWeight = coalesce(RiskWeight, 0)
+| extend NewSignInCountry = isnotempty(SignInCountry) and isnotempty(KnownCountries) and not(set_has_element(KnownCountries, SignInCountry))
+| extend GeoWeight = iff(NewSignInCountry, 2, 0)
+| extend RiskScore = MaxOpWeight + GeoWeight + RiskWeight
+| where RiskScore >= MinScore
+| extend ActorName      = tostring(split(Actor, "@", 0)[0])
+| extend ActorUPNSuffix = tostring(split(Actor, "@", 1)[0])
+| extend Risk_1 = iff(MaxOpWeight >= 3, "SensitiveFollowOnOperation", "")
+| extend Risk_2 = iff(NewSignInCountry, "NewSignInCountry", "")
+| extend Risk_3 = iff(RiskWeight > 0, "ActorAtRisk", "")
+| extend Risk_4 = iff(FollowOnCount >= 5, "HighVolumeFollowOn", "")
+| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
+    iff(isnotempty(Risk_1), strcat(Risk_1, " | "), ""),
+    iff(isnotempty(Risk_2), strcat(Risk_2, " | "), ""),
+    iff(isnotempty(Risk_3), strcat(Risk_3, " | "), ""),
+    iff(isnotempty(Risk_4), strcat(Risk_4, " | "), "")
+))
+| project
+    ActivationTime, Actor, ActorName, ActorUPNSuffix, ActorId, ActorIP, RoleName,
+    RiskScore, MaxOpWeight, GeoWeight, RiskWeight,
+    NewSignInCountry, SignInCountry, KnownCountries,
+    FollowOnCount, FirstFollowOn, FollowOnOps,
+    RiskLevel, RiskState, RiskIndicators, ActivationCorrelationId
+| sort by RiskScore desc, ActivationTime desc
