@@ -1,0 +1,126 @@
+// =====================================================================
+// Attempts to Sign In to Disabled Accounts - Entra ID
+// =====================================================================
+// Description : Detects sign-in attempts to disabled accounts (error 50057), prioritised by
+//               interactivity, time since the account was disabled, and sign-in risk rather
+//               than by application count. App count is kept only as a risk indicator, because
+//               on its own it selects for the benign post-disable token-refresh storm.
+// Type        : Detection
+//
+// Tables      : SigninLogs, AADNonInteractiveUserSignInLogs, AuditLogs, IdentityInfo
+// Connectors  : Microsoft Entra ID (SignInLogs, NonInteractiveUserSignInLogs, AuditLogs),
+//               Microsoft Sentinel UEBA (IdentityInfo)
+// License     : Microsoft Sentinel; Microsoft Entra ID P1 (sign-in / audit logs),
+//               P2 recommended (sign-in risk, UEBA / IdentityInfo)
+//
+// Tuning      : - DetectionWindow - align to run frequency and sign-in ingestion latency
+//               - DisableLookback - set to your AuditLogs retention so older disables still resolve
+//               - StaleDisableDays - days after disabling beyond which attempts are not token refresh
+//               - AppThreshold / VolumeThreshold - thresholds for the MultiAppEnumeration / HighVolume indicators
+//               - SensitiveRoles - roles that set the PrivilegedFormerAccount indicator
+//               - In very noisy tenants, require InteractiveCount >= 2 rather than > 0
+//
+// Known FPs   : - Freshly disabled accounts whose own M365 sessions refresh tokens - non-interactive, recent, suppressed
+//               - A former user trying to sign in once after offboarding - low priority, no stale/risk indicators
+//               - Disable performed via a generic user-update operation - widen the AuditLogs match
+//
+// Author      : Bartosz Wysocki | https://www.itprofessor.cloud
+// Version     : 1.0 | 2026-06-17
+// =====================================================================
+let DetectionWindow = 1h;
+let DisableLookback = 90d;       // how far back to find the account-disable event; match your AuditLogs retention
+let IdentityLookback = 30d;
+let StaleDisableDays = 7;        // attempts this many days after disabling are not explained by token refresh
+let AppThreshold = 3;            // distinct apps for the MultiAppEnumeration indicator (original default)
+let VolumeThreshold = 10;        // attempts for the HighVolume indicator
+let SensitiveRoles = dynamic([
+"Global Administrator",
+"Privileged Role Administrator",
+"Privileged Authentication Administrator",
+"Security Administrator",
+"Exchange Administrator",
+"SharePoint Administrator",
+"User Administrator",
+"Intune Administrator",
+"Application Administrator",
+"Hybrid Identity Administrator"
+]);
+// 50057 attempts from a sign-in table, tagged interactive or not
+let DisabledAttempts = (tableName:string, isInteractive:bool) {
+    table(tableName)
+    | where ResultType == "50057"
+    | project TimeGenerated,
+              UserPrincipalName = tolower(UserPrincipalName),
+              UserId,
+              IPAddress,
+              AppDisplayName,
+              ClientAppUsed,
+              Country = tostring(LocationDetails.countryOrRegion),
+              City = tostring(LocationDetails.city),
+              RiskLevel = tostring(RiskLevelDuringSignIn),
+              IsInteractiveFlag = isInteractive,
+              SourceTable = tableName
+};
+let Attempts = union isfuzzy=true
+        DisabledAttempts("SigninLogs", true),
+        DisabledAttempts("AADNonInteractiveUserSignInLogs", false)
+    | where TimeGenerated > ago(DetectionWindow);
+// When was each targeted account disabled? (Entra audit)
+let DisableEvents = AuditLogs
+    | where TimeGenerated > ago(DisableLookback)
+    | where OperationName has "Disable account"
+    | mv-apply tr = TargetResources on (
+        where isnotempty(tostring(tr.userPrincipalName))
+        | project DisabledUPN = tolower(tostring(tr.userPrincipalName))
+      )
+    | summarize DisabledTime = max(TimeGenerated) by DisabledUPN;
+// Identity context, keyed on UPN
+let IdentityContext = IdentityInfo
+    | where TimeGenerated > ago(IdentityLookback)
+    | summarize arg_max(TimeGenerated, AccountDisplayName, Department, JobTitle, AssignedRoles, GroupMembership, UserType) by AccountUPN = tolower(AccountUPN);
+Attempts
+| extend HighRiskRow = RiskLevel in ("high", "medium")
+| summarize
+    StartTime = min(TimeGenerated),
+    EndTime = max(TimeGenerated),
+    AttemptCount = count(),
+    InteractiveCount = countif(IsInteractiveFlag == true),
+    HighRiskCount = countif(HighRiskRow),
+    AppCount = dcount(AppDisplayName),
+    AppSet = make_set(AppDisplayName, 10),
+    ClientApps = make_set(ClientAppUsed, 10),
+    RiskLevels = make_set(RiskLevel, 5),
+    SourceTables = make_set(SourceTable, 2),
+    Country = max(Country),
+    City = max(City)
+  by UserPrincipalName, IPAddress
+| join kind=leftouter DisableEvents on $left.UserPrincipalName == $right.DisabledUPN
+| join kind=leftouter IdentityContext on $left.UserPrincipalName == $right.AccountUPN
+| extend DaysSinceDisabled = datetime_diff('day', StartTime, DisabledTime)
+| extend IsConfirmedStale = isnotempty(DisabledTime) and DaysSinceDisabled >= StaleDisableDays
+| extend HighRisk = HighRiskCount > 0
+| where InteractiveCount > 0 or IsConfirmedStale or HighRisk
+| extend Name = tostring(split(UserPrincipalName, "@", 0)[0]), UPNSuffix = tostring(split(UserPrincipalName, "@", 1)[0])
+| extend Risk_1 = iff(InteractiveCount > 0, "InteractiveAttempt", "")
+| extend Risk_2 = iff(IsConfirmedStale, "StaleDisabledAccount", "")
+| extend Risk_3 = iff(HighRisk, "HighSignInRisk", "")
+| extend Risk_4 = iff(AppCount >= AppThreshold, "MultiAppEnumeration", "")
+| extend Risk_5 = iff(tostring(AssignedRoles) has_any (SensitiveRoles), "PrivilegedFormerAccount", "")
+| extend Risk_6 = iff(AttemptCount >= VolumeThreshold, "HighVolume", "")
+| extend Risk_7 = iff(UserType =~ "Guest", "GuestAccount", "")
+| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
+    iff(isnotempty(Risk_1), strcat(Risk_1, " | "), ""),
+    iff(isnotempty(Risk_2), strcat(Risk_2, " | "), ""),
+    iff(isnotempty(Risk_3), strcat(Risk_3, " | "), ""),
+    iff(isnotempty(Risk_4), strcat(Risk_4, " | "), ""),
+    iff(isnotempty(Risk_5), strcat(Risk_5, " | "), ""),
+    iff(isnotempty(Risk_6), strcat(Risk_6, " | "), ""),
+    iff(isnotempty(Risk_7), strcat(Risk_7, " | "), "")
+))
+| project
+    StartTime, EndTime, RiskIndicators,
+    UserPrincipalName, Name, UPNSuffix, IPAddress, Country, City,
+    AttemptCount, InteractiveCount, AppCount, AppSet, ClientApps, RiskLevels, SourceTables,
+    DisabledTime, DaysSinceDisabled, IsConfirmedStale,
+    AccountDisplayName, Department, JobTitle, AssignedRoles, GroupMembership, UserType
+| sort by StartTime desc
