@@ -1,0 +1,102 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/disabled-account-signin-attempts')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/disabled-account-signin-attempts')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "Attempts to Sign In to Disabled Accounts - Entra ID",
+                "description": "Detects sign-in attempts to disabled Entra ID accounts (error 50057), prioritised by interactivity, time since the account was disabled, and sign-in risk rather than by raw application count. Unions interactive and non-interactive sign-in logs, resolves each account's disable time from the Entra audit log, enriches with UEBA identity context, and surfaces only attempts that are interactive, confirmed stale (well after the post-disable token-refresh window), or high-risk. App count is retained only as a risk indicator because on its own it selects for the benign post-disable token-refresh storm.\n\nTABLES: SigninLogs, AADNonInteractiveUserSignInLogs, AuditLogs, IdentityInfo\nCONNECTORS: Microsoft Entra ID (SignInLogs, NonInteractiveUserSignInLogs, AuditLogs), Microsoft Sentinel UEBA (IdentityInfo)\nLICENSE: Microsoft Sentinel; Microsoft Entra ID P1 (sign-in / audit logs), P2 recommended (sign-in risk, UEBA / IdentityInfo)\n\nTUNING:\n1. DetectionWindow - align to run frequency and sign-in ingestion latency\n2. DisableLookback - how far back to find the account-disable event; capped at 14 days when deployed as a scheduled rule (see queryPeriod), see BUGS/NOTES\n3. StaleDisableDays - days after disabling beyond which attempts are not token refresh\n4. AppThreshold / VolumeThreshold - thresholds for the MultiAppEnumeration / HighVolume indicators\n5. SensitiveRoles - roles that set the PrivilegedFormerAccount indicator\n6. In very noisy tenants, require InteractiveCount >= 2 rather than > 0\n\nKNOWN FALSE POSITIVES:\n1. Freshly disabled accounts whose own M365 sessions refresh tokens - non-interactive, recent, suppressed by the gating logic\n2. A former user trying to sign in once after offboarding - low priority, no stale / risk indicators\n3. Disable performed via a generic user-update operation - widen the AuditLogs OperationName match\n\nINVESTIGATION STEPS:\n1. Read RiskIndicators - InteractiveAttempt + StaleDisabledAccount + HighSignInRisk together = immediate escalation.\n2. Confirm the account is intentionally disabled (offboarded) and not awaiting re-enable.\n3. Check InteractiveCount - interactive attempts to a disabled account are far more suspicious than token refresh.\n4. Review DaysSinceDisabled - attempts long after disabling are not explained by lingering sessions.\n5. Geolocate IPAddress / Country / City and compare to the former user's known locations.\n6. For PrivilegedFormerAccount, treat as high priority - a disabled admin being probed is a targeted signal.\n7. Review AppSet / ClientApps - spread across many apps suggests enumeration rather than a stuck client.\n8. If the same IP targets multiple disabled accounts, pivot to a broader credential-stuffing investigation.\n\nBLIND SPOTS:\nAs a scheduled rule the queryPeriod caps data at 14 days, so disable events older than 14 days do not resolve and the stale / DaysSinceDisabled enrichment only covers accounts disabled within that window (see BUGS/NOTES). Only catches the 50057 error; accounts blocked by other means produce different codes. Accounts disabled via a non-matching audit operation will not resolve a DisabledTime. IdentityInfo UEBA columns silently return empty if UEBA is not enabled.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 1.0 | 2026-06-17",
+                "severity": "Medium",
+                "enabled": true,
+                "query": "// =====================================================================\n// Attempts to Sign In to Disabled Accounts - Entra ID\n// =====================================================================\n// Tables  : SigninLogs, AADNonInteractiveUserSignInLogs, AuditLogs, IdentityInfo\n// License : Microsoft Sentinel + Microsoft Entra ID P1 (P2 recommended)\n// Tuning  : see rule description for full tuning notes\n// Author  : Bartosz Wysocki | itprofessor.cloud\n// Version : 1.0 | 2026-06-17\n// =====================================================================\nlet DetectionWindow = 1h;\nlet DisableLookback = 90d;       // how far back to find the account-disable event; match your AuditLogs retention\nlet IdentityLookback = 30d;\nlet StaleDisableDays = 7;        // attempts this many days after disabling are not explained by token refresh\nlet AppThreshold = 3;            // distinct apps for the MultiAppEnumeration indicator (original default)\nlet VolumeThreshold = 10;        // attempts for the HighVolume indicator\nlet SensitiveRoles = dynamic([\n\"Global Administrator\",\n\"Privileged Role Administrator\",\n\"Privileged Authentication Administrator\",\n\"Security Administrator\",\n\"Exchange Administrator\",\n\"SharePoint Administrator\",\n\"User Administrator\",\n\"Intune Administrator\",\n\"Application Administrator\",\n\"Hybrid Identity Administrator\"\n]);\n// 50057 attempts from a sign-in table, tagged interactive or not\nlet DisabledAttempts = (tableName:string, isInteractive:bool) {\n    table(tableName)\n    | where ResultType == \"50057\"\n    | project TimeGenerated,\n              UserPrincipalName = tolower(UserPrincipalName),\n              UserId,\n              IPAddress,\n              AppDisplayName,\n              ClientAppUsed,\n              Country = tostring(LocationDetails.countryOrRegion),\n              City = tostring(LocationDetails.city),\n              RiskLevel = tostring(RiskLevelDuringSignIn),\n              IsInteractiveFlag = isInteractive,\n              SourceTable = tableName\n};\nlet Attempts = union isfuzzy=true\n        DisabledAttempts(\"SigninLogs\", true),\n        DisabledAttempts(\"AADNonInteractiveUserSignInLogs\", false)\n    | where TimeGenerated > ago(DetectionWindow);\n// When was each targeted account disabled? (Entra audit)\nlet DisableEvents = AuditLogs\n    | where TimeGenerated > ago(DisableLookback)\n    | where OperationName has \"Disable account\"\n    | mv-apply tr = TargetResources on (\n        where isnotempty(tostring(tr.userPrincipalName))\n        | project DisabledUPN = tolower(tostring(tr.userPrincipalName))\n      )\n    | summarize DisabledTime = max(TimeGenerated) by DisabledUPN;\n// Identity context, keyed on UPN\nlet IdentityContext = IdentityInfo\n    | where TimeGenerated > ago(IdentityLookback)\n    | summarize arg_max(TimeGenerated, AccountDisplayName, Department, JobTitle, AssignedRoles, GroupMembership, UserType) by AccountUPN = tolower(AccountUPN);\nAttempts\n| extend HighRiskRow = RiskLevel in (\"high\", \"medium\")\n| summarize\n    StartTime = min(TimeGenerated),\n    EndTime = max(TimeGenerated),\n    AttemptCount = count(),\n    InteractiveCount = countif(IsInteractiveFlag == true),\n    HighRiskCount = countif(HighRiskRow),\n    AppCount = dcount(AppDisplayName),\n    AppSet = make_set(AppDisplayName, 10),\n    ClientApps = make_set(ClientAppUsed, 10),\n    RiskLevels = make_set(RiskLevel, 5),\n    SourceTables = make_set(SourceTable, 2),\n    Country = max(Country),\n    City = max(City)\n  by UserPrincipalName, IPAddress\n| join kind=leftouter DisableEvents on $left.UserPrincipalName == $right.DisabledUPN\n| join kind=leftouter IdentityContext on $left.UserPrincipalName == $right.AccountUPN\n| extend DaysSinceDisabled = datetime_diff('day', StartTime, DisabledTime)\n| extend IsConfirmedStale = isnotempty(DisabledTime) and DaysSinceDisabled >= StaleDisableDays\n| extend HighRisk = HighRiskCount > 0\n| where InteractiveCount > 0 or IsConfirmedStale or HighRisk\n| extend Name = tostring(split(UserPrincipalName, \"@\", 0)[0]), UPNSuffix = tostring(split(UserPrincipalName, \"@\", 1)[0])\n| extend Risk_1 = iff(InteractiveCount > 0, \"InteractiveAttempt\", \"\")\n| extend Risk_2 = iff(IsConfirmedStale, \"StaleDisabledAccount\", \"\")\n| extend Risk_3 = iff(HighRisk, \"HighSignInRisk\", \"\")\n| extend Risk_4 = iff(AppCount >= AppThreshold, \"MultiAppEnumeration\", \"\")\n| extend Risk_5 = iff(tostring(AssignedRoles) has_any (SensitiveRoles), \"PrivilegedFormerAccount\", \"\")\n| extend Risk_6 = iff(AttemptCount >= VolumeThreshold, \"HighVolume\", \"\")\n| extend Risk_7 = iff(UserType =~ \"Guest\", \"GuestAccount\", \"\")\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n    iff(isnotempty(Risk_1), strcat(Risk_1, \" | \"), \"\"),\n    iff(isnotempty(Risk_2), strcat(Risk_2, \" | \"), \"\"),\n    iff(isnotempty(Risk_3), strcat(Risk_3, \" | \"), \"\"),\n    iff(isnotempty(Risk_4), strcat(Risk_4, \" | \"), \"\"),\n    iff(isnotempty(Risk_5), strcat(Risk_5, \" | \"), \"\"),\n    iff(isnotempty(Risk_6), strcat(Risk_6, \" | \"), \"\"),\n    iff(isnotempty(Risk_7), strcat(Risk_7, \" | \"), \"\")\n))\n| project\n    StartTime, EndTime, RiskIndicators,\n    UserPrincipalName, Name, UPNSuffix, IPAddress, Country, City,\n    AttemptCount, InteractiveCount, AppCount, AppSet, ClientApps, RiskLevels, SourceTables,\n    DisabledTime, DaysSinceDisabled, IsConfirmedStale,\n    AccountDisplayName, Department, JobTitle, AssignedRoles, GroupMembership, UserType\n| sort by StartTime desc",
+                "queryFrequency": "PT1H",
+                "queryPeriod": "P14D",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": [
+                    "InitialAccess",
+                    "CredentialAccess"
+                ],
+                "techniques": [
+                    "T1078",
+                    "T1110"
+                ],
+                "subTechniques": [
+                    "T1078.004"
+                ],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT5H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": [
+                            "Account"
+                        ],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": null
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "SingleAlert"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "Disabled Account Sign-In: {{UserPrincipalName}} from {{IPAddress}}",
+                    "alertDescriptionFormat": "Risk flags: {{RiskIndicators}} | Interactive attempts: {{InteractiveCount}} | Days since disabled: {{DaysSinceDisabled}}"
+                },
+                "customDetails": {
+                    "RiskIndicators": "RiskIndicators",
+                    "InteractiveCount": "InteractiveCount",
+                    "AttemptCount": "AttemptCount",
+                    "AppCount": "AppCount",
+                    "DaysSinceDisabled": "DaysSinceDisabled",
+                    "IsConfirmedStale": "IsConfirmedStale",
+                    "DisabledTime": "DisabledTime",
+                    "Country": "Country",
+                    "UserType": "UserType"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "Name"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "UPNSuffix"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "IPAddress"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}
