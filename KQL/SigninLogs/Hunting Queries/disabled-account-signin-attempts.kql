@@ -28,8 +28,8 @@
 // Version     : 1.0 | 2026-06-17
 // =====================================================================
 let DetectionWindow = 1h;
-let DisableLookback = 90d;       // how far back to find the account-disable event; match your AuditLogs retention
-let IdentityLookback = 30d;
+let DisableLookback = 14d;       // how far back to find the account-disable event; match your AuditLogs retention
+let IdentityLookback = 14d;
 let StaleDisableDays = 7;        // attempts this many days after disabling are not explained by token refresh
 let AppThreshold = 3;            // distinct apps for the MultiAppEnumeration indicator (original default)
 let VolumeThreshold = 10;        // attempts for the HighVolume indicator
