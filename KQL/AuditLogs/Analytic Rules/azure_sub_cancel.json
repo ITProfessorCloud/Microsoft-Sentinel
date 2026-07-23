@@ -1,0 +1,111 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/azure-subscription-cancellation')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/azure-subscription-cancellation')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "Azure Subscription Cancellation or Cancellation Attempt",
+                "description": "Detects successful and failed Azure subscription cancellations. A successful cancellation fires alone; a failed attempt or a cancellation by a trusted decommissioning account only fires when amplified by higher risk context such as the target hosting security tooling, a fresh Owner grant to the caller, a guest caller, or an unrecognised source IP.\n\nTABLES: AzureActivity, IdentityInfo\nCONNECTORS: Azure Activity (per subscription or management group diagnostic settings); UEBA for IdentityInfo\nLICENSE: Any Sentinel-enabled workspace; Entra ID P2 with UEBA adds guest detection and caller enrichment\n\nTUNING:\n1. Query period must be P14D - the 14d Owner grant and identity lookups only resolve if the rule looks back that far. The API caps the frequency at 1 hour once the query period reaches 2 days.\n2. DetectionWindow (15m) does the actual event selection inside the query.\n3. MonitoringSubscriptions - add every subscription ID hosting Sentinel, Log Analytics or collectors; this powers the +5 amplifier.\n4. TrustedCancellers - accounts permitted to cancel under a documented decommissioning process score 4 instead of 10; leave empty in most tenants.\n5. TrustedIpRanges - corporate egress CIDRs; leaving it empty disables the IP amplifier rather than producing false alarms.\n\nKNOWN FALSE POSITIVES:\n1. Planned decommissioning by cloud administrators - handled via TrustedCancellers, or closed as expected activity if the list stays empty.\n2. Failed attempts during tenant cleanup (non-cancellable resources error) - score 6 alone and stay below the threshold of 10.\n\nINVESTIGATION STEPS:\n1. Confirm with the change process whether the cancellation was planned.\n2. Review the caller's sign-in history and the source IP for signs of account compromise.\n3. Check role assignment history; an Owner grant shortly before the cancellation points to privilege escalation.\n4. If the subscription hosts security tooling, verify ingestion and rule execution immediately and reactivate the subscription from the portal.\n5. Review other activity by the same caller across the tenant in the same window.\n\nBLIND SPOTS:\nSubscriptions not exporting Activity logs are invisible. The Owner grant amplifier misses management group scope assignments. Billing side cancellations (for example CSP Partner Center) may not surface in AzureActivity. If the cancelled subscription hosts the only Sentinel workspace, the alert may not win the race before resources are disabled; export Activity logs to a workspace in a separate management subscription.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 1.0 | 2026-07-20",
+                "severity": "High",
+                "enabled": true,
+                "query": "// =====================================================================\n// Azure Subscription Cancellation or Cancellation Attempt\n// =====================================================================\n// Description : Detects successful and failed Azure subscription\n//               cancellations from Activity log data, scored with weighted\n//               risk signals (monitoring subscription target, fresh Owner\n//               grant, guest caller, unknown IP); planned decommissioning\n//               is suppressed via a trusted canceller list scoring below\n//               the fire threshold.\n// Type        : Detection\n//\n// Tables      : AzureActivity, IdentityInfo\n// Connectors  : Azure Activity (per subscription or management group\n//               diagnostic settings); UEBA for IdentityInfo\n// License     : Any Sentinel-enabled workspace; Entra ID P2 with UEBA\n//               adds guest detection and caller enrichment\n//\n// Tuning      : - Set the rule query period to P14D; the 14d Owner grant\n//                 and identity lookups only resolve if the rule itself\n//                 looks back that far\n//               - DetectionWindow - events scored per run; keep wider\n//                 than the frequency to absorb Activity log latency\n//               - MonitoringSubscriptions - subscription IDs hosting\n//                 Sentinel or log collection; powers the +5 amplifier\n//               - TrustedCancellers - decommissioning accounts whose\n//                 successful cancellations score below threshold\n//               - TrustedIpRanges - corporate egress CIDRs; empty\n//                 disables the IP amplifier entirely\n//\n// Known FPs   : - Planned decommissioning by cloud administrators; list\n//                 the account in TrustedCancellers to score it at 4\n//               - Failed attempts from tenant cleanup hitting the\n//                 non-cancellable resources error; score 6 alone and\n//                 stay silent without an amplifier\n//\n// Author      : Bartosz Wysocki | https://www.itprofessor.cloud\n// Version     : 1.0 | 2026-07-20\n// =====================================================================\n// Tuning variables\nlet DetectionWindow = 15m;            // window scored per run; wider than the 5 minute frequency to absorb Activity log latency\nlet OwnerGrantLookback = 1d;         // history window for fresh Owner grants to the caller\nlet IdentityLookback = 1d;           // IdentityInfo snapshot window\nlet MonitoringSubscriptions = dynamic([]);  // subscription IDs hosting Sentinel, Log Analytics or other security tooling\nlet TrustedCancellers = dynamic([]);        // accounts permitted to cancel subscriptions under a documented decommissioning process\nlet TrustedIpRanges = dynamic([]);          // corporate egress ranges in CIDR notation; leave empty to disable the IP check\n// Scoring: weighted signals feed an additive RiskScore gated by FireThreshold\nlet FireThreshold = 10;\nlet W_CancelSuccess = 10;             // successful cancellation, clears the threshold alone\nlet W_CancelTrusted = 4;              // successful cancellation by a trusted decommissioning account\nlet W_CancelFailed = 6;               // blocked attempt, needs at least one amplifier\nlet W_MonitoringSub = 5;              // the target subscription hosts your security tooling\nlet W_FreshOwner = 4;                 // caller received Owner on the target subscription inside the lookback\nlet W_GuestCaller = 3;                // caller is a guest account\nlet W_UnknownIp = 2;                  // caller IP sits outside your declared ranges\nlet OwnerRoleId = \"8e3af657-a8ff-443c-a75c-2fe8c4bcb635\";  // built-in Owner role definition ID\n// Latest identity snapshot per account for caller enrichment; absent UEBA degrades to silence\nlet Identity = IdentityInfo\n    | where TimeGenerated > ago(IdentityLookback)\n    | extend JoinUpn = tolower(AccountUPN)\n    | summarize arg_max(TimeGenerated, AccountObjectId, AccountDisplayName, Department, JobTitle, UserType) by JoinUpn;\n// Owner role grants inside the lookback, resolved to principal and subscription\nlet FreshOwnerGrants = AzureActivity\n    | where TimeGenerated > ago(OwnerGrantLookback)\n    | where OperationNameValue =~ \"Microsoft.Authorization/roleAssignments/write\"\n    | where ActivityStatusValue in (\"Success\", \"Succeeded\")\n    | where Properties has OwnerRoleId\n    | extend RequestBody = todynamic(tostring(parse_json(Properties).requestbody))\n    | extend GrantedPrincipalId = tolower(tostring(RequestBody.Properties.PrincipalId))\n    | where isnotempty(GrantedPrincipalId)\n    | summarize GrantTime = max(TimeGenerated) by GrantSubscriptionId = SubscriptionId, GrantedPrincipalId;\n// Main pipeline: cancellation actions in the current detection window\nAzureActivity\n| where TimeGenerated > ago(DetectionWindow)\n| where CategoryValue == \"Administrative\"\n| where OperationNameValue in~ (\"Microsoft.Subscription/cancel/action\", \"Microsoft.Subscription/subscriptions/cancel/action\")\n| where ActivityStatusValue in (\"Success\", \"Failure\", \"Failed\")\n| extend Props = parse_json(Properties)\n| extend ManagementGroup = tostring(split(tostring(Props.hierarchy), \"/\")[-2])\n| extend JoinUpn = tolower(Caller)\n| join kind=leftouter Identity on JoinUpn\n| extend CallerObjectId = tolower(AccountObjectId)\n| join kind=leftouter FreshOwnerGrants on $left.CallerObjectId == $right.GrantedPrincipalId, $left.SubscriptionId == $right.GrantSubscriptionId\n| extend IsSuccess = ActivityStatusValue == \"Success\"\n| extend IsTrusted = Caller in~ (TrustedCancellers)\n| extend Risk_1 = case(\n    IsSuccess and IsTrusted, strcat(\"Cancelled by trusted decommissioning account [+\", W_CancelTrusted, \"]\"),\n    IsSuccess, strcat(\"Subscription cancelled [+\", W_CancelSuccess, \"]\"),\n    strcat(\"Cancellation attempt failed [+\", W_CancelFailed, \"]\"))\n| extend Risk_2 = iff(SubscriptionId in~ (MonitoringSubscriptions), strcat(\"Subscription hosts security tooling [+\", W_MonitoringSub, \"]\"), \"\")\n| extend Risk_3 = iff(isnotempty(GrantTime), strcat(\"Caller granted Owner on \", format_datetime(GrantTime, \"yyyy-MM-dd\"), \" [+\", W_FreshOwner, \"]\"), \"\")\n| extend Risk_4 = iff(UserType == \"Guest\" or Caller has \"#EXT#\", strcat(\"Caller is a guest account [+\", W_GuestCaller, \"]\"), \"\")\n| extend Risk_5 = iff(isnotempty(CallerIpAddress) and array_length(TrustedIpRanges) > 0 and ipv4_is_in_any_range(CallerIpAddress, TrustedIpRanges) == false, strcat(\"Caller IP outside trusted ranges [+\", W_UnknownIp, \"]\"), \"\")\n| extend RiskScore =\n    case(IsSuccess and IsTrusted, W_CancelTrusted, IsSuccess, W_CancelSuccess, W_CancelFailed)\n    + iff(isnotempty(Risk_2), W_MonitoringSub, 0)\n    + iff(isnotempty(Risk_3), W_FreshOwner, 0)\n    + iff(isnotempty(Risk_4), W_GuestCaller, 0)\n    + iff(isnotempty(Risk_5), W_UnknownIp, 0)\n| where RiskScore >= FireThreshold\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n    iff(isnotempty(Risk_1), strcat(Risk_1, \" | \"), \"\"),\n    iff(isnotempty(Risk_2), strcat(Risk_2, \" | \"), \"\"),\n    iff(isnotempty(Risk_3), strcat(Risk_3, \" | \"), \"\"),\n    iff(isnotempty(Risk_4), strcat(Risk_4, \" | \"), \"\"),\n    iff(isnotempty(Risk_5), strcat(Risk_5, \" | \"), \"\")))\n| extend CancelStatus = iff(IsSuccess, \"Cancelled\", \"Attempt failed\")\n| extend Name = tostring(split(Caller, \"@\", 0)[0])\n| extend UPNSuffix = iff(Caller has \"#EXT#\", extract(@\"_([^_]+)#EXT#\", 1, Caller), tostring(split(Caller, \"@\", 1)[0]))\n| extend SubscriptionResourceId = strcat(\"/subscriptions/\", SubscriptionId)\n| project TimeGenerated, Caller, Name, UPNSuffix, CallerIpAddress, SubscriptionId, SubscriptionResourceId, ManagementGroup, CancelStatus, AccountDisplayName, Department, JobTitle, UserType, RiskScore, RiskIndicators\n| sort by RiskScore desc, TimeGenerated desc\n",
+                "queryFrequency": "PT15M",
+                "queryPeriod": "P1D",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": [
+                    "Impact",
+                    "DefenseEvasion"
+                ],
+                "techniques": [
+                    "T1489",
+                    "T1562"
+                ],
+                "subTechniques": [
+                    "T1562.008"
+                ],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT6H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": [
+                            "Account"
+                        ],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": []
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "AlertPerResult"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "Azure subscription cancellation activity by {{Caller}}",
+                    "alertDescriptionFormat": "{{Caller}} performed a subscription cancellation action against {{SubscriptionId}}. Indicators: {{RiskIndicators}}",
+                    "alertDynamicProperties": []
+                },
+                "customDetails": {
+                    "SubscriptionId": "SubscriptionId",
+                    "ManagementGroup": "ManagementGroup",
+                    "CancelStatus": "CancelStatus",
+                    "CallerDepartment": "Department",
+                    "CallerJobTitle": "JobTitle",
+                    "CallerUserType": "UserType",
+                    "RiskScore": "RiskScore",
+                    "RiskIndicators": "RiskIndicators"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "Name"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "UPNSuffix"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "CallerIpAddress"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "AzureResource",
+                        "fieldMappings": [
+                            {
+                                "identifier": "ResourceId",
+                                "columnName": "SubscriptionResourceId"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}
