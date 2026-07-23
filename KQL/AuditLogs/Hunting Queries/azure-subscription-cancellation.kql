@@ -1,0 +1,111 @@
+// =====================================================================
+// Azure Subscription Cancellation or Cancellation Attempt
+// =====================================================================
+// Description : Detects successful and failed Azure subscription
+//               cancellations from Activity log data, scored with weighted
+//               risk signals (monitoring subscription target, fresh Owner
+//               grant, guest caller, unknown IP); planned decommissioning
+//               is suppressed via a trusted canceller list scoring below
+//               the fire threshold.
+// Type        : Detection
+//
+// Tables      : AzureActivity, IdentityInfo
+// Connectors  : Azure Activity (per subscription or management group
+//               diagnostic settings); UEBA for IdentityInfo
+// License     : Any Sentinel-enabled workspace; Entra ID P2 with UEBA
+//               adds guest detection and caller enrichment
+//
+// Tuning      : - Set the rule query period to P14D; the 14d Owner grant
+//                 and identity lookups only resolve if the rule itself
+//                 looks back that far
+//               - DetectionWindow - events scored per run; keep wider
+//                 than the frequency to absorb Activity log latency
+//               - MonitoringSubscriptions - subscription IDs hosting
+//                 Sentinel or log collection; powers the +5 amplifier
+//               - TrustedCancellers - decommissioning accounts whose
+//                 successful cancellations score below threshold
+//               - TrustedIpRanges - corporate egress CIDRs; empty
+//                 disables the IP amplifier entirely
+//
+// Known FPs   : - Planned decommissioning by cloud administrators; list
+//                 the account in TrustedCancellers to score it at 4
+//               - Failed attempts from tenant cleanup hitting the
+//                 non-cancellable resources error; score 6 alone and
+//                 stay silent without an amplifier
+//
+// Author      : Bartosz Wysocki | https://www.itprofessor.cloud
+// Version     : 1.0 | 2026-07-20
+// =====================================================================
+// Tuning variables
+let DetectionWindow = 15m;            // window scored per run; wider than the 5 minute frequency to absorb Activity log latency
+let OwnerGrantLookback = 14d;         // history window for fresh Owner grants to the caller
+let IdentityLookback = 14d;           // IdentityInfo snapshot window
+let MonitoringSubscriptions = dynamic([]);  // subscription IDs hosting Sentinel, Log Analytics or other security tooling
+let TrustedCancellers = dynamic([]);        // accounts permitted to cancel subscriptions under a documented decommissioning process
+let TrustedIpRanges = dynamic([]);          // corporate egress ranges in CIDR notation; leave empty to disable the IP check
+// Scoring: weighted signals feed an additive RiskScore gated by FireThreshold
+let FireThreshold = 10;
+let W_CancelSuccess = 10;             // successful cancellation, clears the threshold alone
+let W_CancelTrusted = 4;              // successful cancellation by a trusted decommissioning account
+let W_CancelFailed = 6;               // blocked attempt, needs at least one amplifier
+let W_MonitoringSub = 5;              // the target subscription hosts your security tooling
+let W_FreshOwner = 4;                 // caller received Owner on the target subscription inside the lookback
+let W_GuestCaller = 3;                // caller is a guest account
+let W_UnknownIp = 2;                  // caller IP sits outside your declared ranges
+let OwnerRoleId = "8e3af657-a8ff-443c-a75c-2fe8c4bcb635";  // built-in Owner role definition ID
+// Latest identity snapshot per account for caller enrichment; absent UEBA degrades to silence
+let Identity = IdentityInfo
+    | where TimeGenerated > ago(IdentityLookback)
+    | extend JoinUpn = tolower(AccountUPN)
+    | summarize arg_max(TimeGenerated, AccountObjectId, AccountDisplayName, Department, JobTitle, UserType) by JoinUpn;
+// Owner role grants inside the lookback, resolved to principal and subscription
+let FreshOwnerGrants = AzureActivity
+    | where TimeGenerated > ago(OwnerGrantLookback)
+    | where OperationNameValue =~ "Microsoft.Authorization/roleAssignments/write"
+    | where ActivityStatusValue in ("Success", "Succeeded")
+    | where Properties has OwnerRoleId
+    | extend RequestBody = todynamic(tostring(parse_json(Properties).requestbody))
+    | extend GrantedPrincipalId = tolower(tostring(RequestBody.Properties.PrincipalId))
+    | where isnotempty(GrantedPrincipalId)
+    | summarize GrantTime = max(TimeGenerated) by GrantSubscriptionId = SubscriptionId, GrantedPrincipalId;
+// Main pipeline: cancellation actions in the current detection window
+AzureActivity
+| where TimeGenerated > ago(DetectionWindow)
+| where CategoryValue == "Administrative"
+| where OperationNameValue in~ ("Microsoft.Subscription/cancel/action", "Microsoft.Subscription/subscriptions/cancel/action")
+| where ActivityStatusValue in ("Success", "Failure", "Failed")
+| extend Props = parse_json(Properties)
+| extend ManagementGroup = tostring(split(tostring(Props.hierarchy), "/")[-2])
+| extend JoinUpn = tolower(Caller)
+| join kind=leftouter Identity on JoinUpn
+| extend CallerObjectId = tolower(AccountObjectId)
+| join kind=leftouter FreshOwnerGrants on $left.CallerObjectId == $right.GrantedPrincipalId, $left.SubscriptionId == $right.GrantSubscriptionId
+| extend IsSuccess = ActivityStatusValue == "Success"
+| extend IsTrusted = Caller in~ (TrustedCancellers)
+| extend Risk_1 = case(
+    IsSuccess and IsTrusted, strcat("Cancelled by trusted decommissioning account [+", W_CancelTrusted, "]"),
+    IsSuccess, strcat("Subscription cancelled [+", W_CancelSuccess, "]"),
+    strcat("Cancellation attempt failed [+", W_CancelFailed, "]"))
+| extend Risk_2 = iff(SubscriptionId in~ (MonitoringSubscriptions), strcat("Subscription hosts security tooling [+", W_MonitoringSub, "]"), "")
+| extend Risk_3 = iff(isnotempty(GrantTime), strcat("Caller granted Owner on ", format_datetime(GrantTime, "yyyy-MM-dd"), " [+", W_FreshOwner, "]"), "")
+| extend Risk_4 = iff(UserType == "Guest" or Caller has "#EXT#", strcat("Caller is a guest account [+", W_GuestCaller, "]"), "")
+| extend Risk_5 = iff(isnotempty(CallerIpAddress) and array_length(TrustedIpRanges) > 0 and ipv4_is_in_any_range(CallerIpAddress, TrustedIpRanges) == false, strcat("Caller IP outside trusted ranges [+", W_UnknownIp, "]"), "")
+| extend RiskScore =
+    case(IsSuccess and IsTrusted, W_CancelTrusted, IsSuccess, W_CancelSuccess, W_CancelFailed)
+    + iff(isnotempty(Risk_2), W_MonitoringSub, 0)
+    + iff(isnotempty(Risk_3), W_FreshOwner, 0)
+    + iff(isnotempty(Risk_4), W_GuestCaller, 0)
+    + iff(isnotempty(Risk_5), W_UnknownIp, 0)
+| where RiskScore >= FireThreshold
+| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
+    iff(isnotempty(Risk_1), strcat(Risk_1, " | "), ""),
+    iff(isnotempty(Risk_2), strcat(Risk_2, " | "), ""),
+    iff(isnotempty(Risk_3), strcat(Risk_3, " | "), ""),
+    iff(isnotempty(Risk_4), strcat(Risk_4, " | "), ""),
+    iff(isnotempty(Risk_5), strcat(Risk_5, " | "), "")))
+| extend CancelStatus = iff(IsSuccess, "Cancelled", "Attempt failed")
+| extend Name = tostring(split(Caller, "@", 0)[0])
+| extend UPNSuffix = iff(Caller has "#EXT#", extract(@"_([^_]+)#EXT#", 1, Caller), tostring(split(Caller, "@", 1)[0]))
+| extend SubscriptionResourceId = strcat("/subscriptions/", SubscriptionId)
+| project TimeGenerated, Caller, Name, UPNSuffix, CallerIpAddress, SubscriptionId, SubscriptionResourceId, ManagementGroup, CancelStatus, AccountDisplayName, Department, JobTitle, UserType, RiskScore, RiskIndicators
+| sort by RiskScore desc, TimeGenerated desc
