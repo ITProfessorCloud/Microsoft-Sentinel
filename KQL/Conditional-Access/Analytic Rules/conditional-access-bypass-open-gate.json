@@ -1,0 +1,104 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/conditional-access-bypass-open-gate')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/conditional-access-bypass-open-gate')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "Conditional Access Bypass - Open Gate or Legacy Auth Success",
+                "description": "Detects successful sign-ins that bypassed Conditional Access, either structurally (legacy / non-modern auth that grant controls cannot reach) or functionally (an enabled CA policy reported failure but the sign-in still succeeded). Unions interactive and non-interactive sign-in logs, normalizes nested device/location/status fields, excludes report-only policy results, suppresses benign status codes, enriches with a 1-day CA-failure grind baseline and UEBA identity context, then scores each result with a composite RiskIndicators field.\n\nTABLES: SigninLogs, AADNonInteractiveUserSignInLogs, IdentityInfo\nCONNECTORS: Microsoft Entra ID (Diagnostic Settings - SignInLogs, NonInteractiveUserSignInLogs), Microsoft Sentinel UEBA (IdentityInfo)\nLICENSE: Microsoft Sentinel (Log Analytics workspace) + Microsoft Entra ID P1 (CA logs); P2 recommended (sign-in risk, UEBA / IdentityInfo)\n\nTUNING:\n1. LegacyAuthClients list - which ClientAppUsed values count as legacy; trim to what you have not yet blocked\n2. SensitiveApps list - optional allowlist of AppDisplayName/ResourceDisplayName to focus on; empty = all apps\n3. BenignErrorCodes list - status/error codes to suppress; replaces the original ConditionalAccessBenignStatusCodes watchlist\n4. GrindThreshold - prior-failure count that sets PrecededByRepeatedFailures\n5. DetectionWindow - keep aligned to the rule run frequency\n\nKNOWN FALSE POSITIVES:\n1. Sanctioned service mailboxes or scanners still using legacy protocols - add to an exclusion or SensitiveApps inversion\n2. Migration / coexistence tooling authenticating over EWS or Exchange Online PowerShell - baseline and exclude by app\n3. Report-only policies are excluded by design; verify if your tenant runs heavily in report-only\n4. Single-factor successes on apps genuinely outside any MFA policy - tune SensitiveApps to focus the SingleFactorOnly signal\n\nINVESTIGATION STEPS:\n1. Check Signal - LegacyAuthSuccess (structural) vs FailOpenControl (a policy reported failure yet sign-in succeeded).\n2. Review RiskIndicators - ControlFailedButSignInSucceeded + ElevatedSignInRisk + SingleFactorOnly together = immediate escalation.\n3. For FailOpenControl, examine FailedPolicy / FailedPolicyResult - which enforcing policy did not engage, and why.\n4. For LegacyAuthSuccess, confirm whether the ClientAppUsed protocol is expected for this user/app or should be blocked.\n5. Check PriorCAFailures / DistinctFailingIPs - a bypass preceded by repeated failures suggests a grind into a gap.\n6. Review RiskLevelDuringSignIn, IPAddress, City/Country and DeviceId against the user's normal pattern.\n7. If IsServiceAccount is true, validate the app/protocol is a sanctioned automation path; otherwise treat as suspicious.\n8. Correlate CorrelationId across SigninLogs for the full authentication chain.\n\nBLIND SPOTS:\nDoes not detect CA policy configuration tampering (disable/scope changes) - build the companion AuditLogs detection for that. Report-only policy results are intentionally excluded. Bypasses that produce no sign-in log (e.g. token replay outside these tables) are not covered. IdentityInfo UEBA columns silently return empty if UEBA is not enabled.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 1.0 | 2026-06-15",
+                "severity": "Medium",
+                "enabled": true,
+                "query": "// =====================================================================\n// Conditional Access Bypass - Open Gate or Legacy Auth Success\n// =====================================================================\n// Tables : SigninLogs, AADNonInteractiveUserSignInLogs, IdentityInfo\n// License : Microsoft Sentinel + Microsoft Entra ID P1 (P2 recommended)\n// Tuning : see rule description for full tuning notes\n// Author : Bartosz Wysocki | itprofessor.cloud\n// Version : 1.0 | 2026-06-15\n// =====================================================================\nlet LegacyAuthClients = dynamic([\n\"Other clients\",\n\"IMAP4\",\n\"POP3\",\n\"SMTP\",\n\"Authenticated SMTP\",\n\"MAPI\",\n\"Exchange ActiveSync\",\n\"Exchange Web Services\",\n\"Exchange Online PowerShell\",\n\"AutoDiscover\"\n]);\nlet SensitiveApps = dynamic([]); // empty = evaluate all apps; populate to focus SensitiveAppAccessed\nlet BenignErrorCodes = dynamic([\"50140\"]); // example: 'keep me signed in' interrupt; tune for your environment\nlet GrindThreshold = 5;\nlet DetectionWindow = 1h;\n// Normalizer: flatten the nested device / location / status fields once, reuse per branch\nlet NormalizeSignins = (tableName:string) {\n table(tableName)\n | extend CAPolicies = parse_json(ConditionalAccessPolicies),\n DeviceDetailJson = todynamic(DeviceDetail),\n LocationJson = todynamic(LocationDetails),\n StatusJson = todynamic(Status)\n | extend OS = tostring(DeviceDetailJson.operatingSystem),\n Browser = tostring(DeviceDetailJson.browser),\n DeviceId = tostring(DeviceDetailJson.deviceId),\n IsCompliant = tostring(DeviceDetailJson.isCompliant),\n City = tostring(LocationJson.city),\n State = tostring(LocationJson.state),\n Country = tostring(LocationJson.countryOrRegion),\n StatusErrorCode = tostring(StatusJson.errorCode),\n StatusDetails = tostring(StatusJson.additionalDetails),\n SourceTable = tableName\n};\n// Grind context: CA failures per user over 1d, keyed on stable UserId (not user agent)\nlet GrindBaseline = SigninLogs\n | where TimeGenerated > ago(1d)\n | where ConditionalAccessStatus =~ \"failure\"\n | summarize PriorCAFailures = count(), DistinctFailingIPs = dcount(IPAddress) by UserId;\nlet IdentityContext = IdentityInfo\n | where TimeGenerated > ago(14d)\n | summarize arg_max(TimeGenerated, *) by AccountUPN\n | project AccountUPN, AccountCreationTime, Department, JobTitle, Manager, AssignedRoles, IsMFARegistered, IsAccountEnabled, IsServiceAccount, EntityRiskScore, UserType;\n// --- Branch A: structural bypass - legacy / non-modern auth that SUCCEEDED ---\n// This is the branch where the non-interactive table earns its place\nlet LegacyBypass = union isfuzzy=true\n (NormalizeSignins(\"SigninLogs\")),\n (NormalizeSignins(\"AADNonInteractiveUserSignInLogs\"))\n | where TimeGenerated > ago(DetectionWindow)\n | where ResultType == \"0\"\n | where ClientAppUsed in~ (LegacyAuthClients)\n | extend Signal = \"LegacyAuthSuccess\", FailedPolicy = \"\", FailedPolicyResult = \"\";\n// --- Branch B: functional bypass - enabled CA policy reported failure but sign-in SUCCEEDED ---\n// Interactive only; report-only results are excluded so we only see enforcing policies\nlet FailOpenBypass = NormalizeSignins(\"SigninLogs\")\n | where TimeGenerated > ago(DetectionWindow)\n | where ResultType == \"0\"\n | mv-apply CAP = CAPolicies on (\n where tostring(CAP.result) =~ \"failure\"\n and isnotempty(CAP.enforcedGrantControls)\n | project FailedPolicy = tostring(CAP.displayName),\n FailedPolicyResult = tostring(CAP.result)\n )\n | extend Signal = \"FailOpenControl\";\n// --- Combine, filter benign, enrich, score ---\nunion LegacyBypass, FailOpenBypass\n| where StatusErrorCode !in (BenignErrorCodes)\n| join kind=leftouter GrindBaseline on UserId\n| extend PriorCAFailures = coalesce(PriorCAFailures, 0), DistinctFailingIPs = coalesce(DistinctFailingIPs, 0)\n| join kind=leftouter IdentityContext on $left.UserPrincipalName == $right.AccountUPN\n| extend TargetAccountAgeDays = datetime_diff('day', now(), AccountCreationTime)\n| extend Name = tostring(split(UserPrincipalName, \"@\")[0]), UPNSuffix = tostring(split(UserPrincipalName, \"@\")[1])\n| extend Risk_1 = iff(Signal == \"LegacyAuthSuccess\", \"LegacyAuthBypass\", \"\")\n| extend Risk_2 = iff(Signal == \"FailOpenControl\", \"ControlFailedButSignInSucceeded\", \"\")\n| extend Risk_3 = iff(tolower(tostring(RiskLevelDuringSignIn)) in (\"high\", \"medium\"), \"ElevatedSignInRisk\", \"\")\n| extend Risk_4 = iff(AuthenticationRequirement =~ \"singleFactorAuthentication\", \"SingleFactorOnly\", \"\")\n| extend Risk_5 = iff(PriorCAFailures >= GrindThreshold, \"PrecededByRepeatedFailures\", \"\")\n| extend Risk_6 = iff(IsServiceAccount == true, \"TargetIsServiceAccount\", \"\")\n| extend Risk_7 = iff(array_length(SensitiveApps) > 0 and (AppDisplayName in~ (SensitiveApps) or ResourceDisplayName in~ (SensitiveApps)), \"SensitiveAppAccessed\", \"\")\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n iff(isnotempty(Risk_1), strcat(Risk_1, \" | \"), \"\"),\n iff(isnotempty(Risk_2), strcat(Risk_2, \" | \"), \"\"),\n iff(isnotempty(Risk_3), strcat(Risk_3, \" | \"), \"\"),\n iff(isnotempty(Risk_4), strcat(Risk_4, \" | \"), \"\"),\n iff(isnotempty(Risk_5), strcat(Risk_5, \" | \"), \"\"),\n iff(isnotempty(Risk_6), strcat(Risk_6, \" | \"), \"\"),\n iff(isnotempty(Risk_7), strcat(Risk_7, \" | \"), \"\")\n))\n| project\n TimeGenerated, Signal, RiskIndicators,\n UserPrincipalName, Name, UPNSuffix, UserId,\n AppDisplayName, ResourceDisplayName, ClientAppUsed,\n ResultType, ResultDescription, ConditionalAccessStatus,\n FailedPolicy, FailedPolicyResult,\n AuthenticationRequirement, RiskLevelDuringSignIn, RiskState,\n IPAddress, City, State, Country, OS, Browser, DeviceId, IsCompliant,\n StatusErrorCode, StatusDetails,\n PriorCAFailures, DistinctFailingIPs,\n Department, JobTitle, Manager, AssignedRoles,\n IsMFARegistered, IsAccountEnabled, IsServiceAccount, EntityRiskScore, UserType, TargetAccountAgeDays,\n CorrelationId, SourceTable, Id\n| sort by TimeGenerated desc",
+                "queryFrequency": "PT1H",
+                "queryPeriod": "PT1H",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": [
+                    "DefenseEvasion",
+                    "CredentialAccess"
+                ],
+                "techniques": [
+                    "T1556",
+                    "T1078",
+                    "T1110"
+                ],
+                "subTechniques": [
+                    "T1556.009",
+                    "T1078.004"
+                ],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT5H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": [
+                            "Account"
+                        ],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": null
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "SingleAlert"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "CA Bypass [{{Signal}}]: {{UserPrincipalName}} reached {{AppDisplayName}}",
+                    "alertDescriptionFormat": "Risk flags: {{RiskIndicators}} | Client app: {{ClientAppUsed}} | Source IP: {{IPAddress}}"
+                },
+                "customDetails": {
+                    "Signal": "Signal",
+                    "RiskIndicators": "RiskIndicators",
+                    "ClientAppUsed": "ClientAppUsed",
+                    "AppDisplayName": "AppDisplayName",
+                    "FailedPolicy": "FailedPolicy",
+                    "FailedPolicyResult": "FailedPolicyResult",
+                    "AuthRequirement": "AuthenticationRequirement",
+                    "SignInRiskLevel": "RiskLevelDuringSignIn",
+                    "PriorCAFailures": "PriorCAFailures"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "Name"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "UPNSuffix"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "IPAddress"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}

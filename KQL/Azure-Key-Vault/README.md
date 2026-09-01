@@ -35,3 +35,9 @@ These queries help you spot attackers who've made it to Key Vault. Once an attac
 ## Source
 
 Full blog post: [Azure Key Vault: The High-Value Queries Your SOC Isn't Running](https://www.itprofessor.cloud/azure-key-vault-threat-hunting-kql/)
+
+## Available Detections
+
+| Rule | Description | Blog |
+| ---- | ----------- | ---- |
+| [Key Vault Mass Secret Retrieval - Behavioural](https://github.com/ITProfessorCloud/Microsoft-Sentinel/blob/main/KQL/Azure-Key-Vault/Analytic%20Rules/keyvault-mass-secret-retrieval.json) | Detects a caller reading an unusual number of distinct Key Vault secrets, judged against that caller own fourteen-day history rather than a flat threshold. Only operations that return secret material are counted, and request URIs are normalised to secret names so version churn cannot inflate the count. Enumeration, new source IPs, new vaults, a brand-new caller identity, and failure bursts all add to the score, while first-seen Microsoft service identities are damped and human callers are never damped. | [Read Blog](https://www.itprofessor.cloud/fixing-the-mass-secret-retrieval-from-azure-key-vault-analytic-rule/) |

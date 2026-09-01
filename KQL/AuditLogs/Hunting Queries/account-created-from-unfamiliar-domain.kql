@@ -1,0 +1,172 @@
+// =====================================================================
+// Account Created From Unfamiliar Domain - Entra ID
+// =====================================================================
+// Description : Detects accounts created with a source domain never seen in the tenant,
+//               scored by what makes the novelty dangerous: a member account on a domain the
+//               tenant only just verified (federation backdoor territory), a recent domain or
+//               federation configuration change matching the new domain, a lookalike of your
+//               own domains, bulk creation from one new domain, a guest doing the inviting,
+//               consumer mail sources and off-hours timing. The baseline is the standing
+//               directory plus prior creation history, not sign-ins, so an attacker cannot
+//               approve their own domain by authenticating with it.
+// Type        : Detection
+//
+// Tables      : AuditLogs, IdentityInfo
+// Connectors  : Microsoft Entra ID (AuditLogs), Microsoft Sentinel UEBA (IdentityInfo)
+// License     : Microsoft Sentinel; Microsoft Entra ID P1 (audit logs),
+//               P2 recommended (UEBA / IdentityInfo for the directory-domain baseline)
+//
+// Tuning      : - Set the rule query period to P14D; the 14d baselines only resolve if the rule looks back that far
+//               - BulkDomainThreshold - distinct accounts from one new domain that count as bulk
+//               - FreeMailDomains - consumer mail providers; empty the list if consumer guests are routine for you
+//               - W_GuestInviter - raise it if guests cannot invite in your tenant, so any hit fires alone
+//               - BusinessStart / BusinessEnd - local working hours; TimeGenerated is UTC, shift to your tenant
+//               - TenantLabels strlen filter - raise from 5 if your domain labels are short and generic
+//
+// Known FPs   : - Planned onboarding of a new brand or partner domain - fires once, then the domain enters
+//                 the baseline and never repeats; close as expected change
+//               - Cross-tenant synchronisation onboarding a partner tenant - bulk novel-domain accounts;
+//                 exclude the sync principal or expect one incident per new partner
+//               - Contractors on consumer mail - amplifier only; zero the FreeMail weight if routine
+//
+// Author      : Bartosz Wysocki | https://www.itprofessor.cloud
+// Version     : 1.0 | 2026-07-02
+// =====================================================================
+let DetectionWindow = 1h;
+let BaselineLookback = 14d;       // prior creation history for the domain baseline
+let IdentityLookback = 14d;       // full UEBA sync cycle; the standing directory population
+let DomainOpsLookback = 14d;      // window for verified-domain and federation configuration changes
+let BulkDomainThreshold = 3;      // distinct accounts from one new domain that count as bulk
+let BusinessStart = 7;
+let BusinessEnd = 19;
+let FireThreshold = 4;
+// Scoring weights - the impossible-without-a-verified-domain case and the config follow-on carry the most
+let W_MemberDomain = 6;           // member account on a domain the tenant never had
+let W_DomainConfig = 5;           // the new domain matches a recent domain or federation configuration change
+let W_Lookalike = 4;              // the new domain contains one of your own domain labels
+let W_BulkDomain = 4;             // bulk creation from a single new domain
+let W_GuestInviter = 3;           // the initiator is itself a guest account
+let W_FreeMail = 2;               // consumer mail source domain
+let W_OffHours = 1;               // activity outside working hours
+let FreeMailDomains = dynamic([
+"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+"yahoo.com", "icloud.com", "proton.me", "protonmail.com", "aol.com",
+"gmx.com", "mail.com", "yandex.com"
+]);
+// Home domain of a UPN. Invited guests carry the mangled form (the address's @ becomes the final
+// underscore before #EXT#), so take the last segment; plain addresses split on @. Handles both shapes.
+let HomeDomain = (u:string) {
+    tolower(iff(u contains "#EXT#", extract(@"_([^_]+)#EXT#", 1, u), tostring(split(u, "@")[1])))
+};
+// Every domain the tenant already knows: the standing directory (UPN and mail) plus accounts
+// created earlier in the lookback, excluding the current window so creations cannot self-baseline
+let KnownDomains = union
+    (IdentityInfo
+        | where TimeGenerated > ago(IdentityLookback)
+        | extend Ds = pack_array(HomeDomain(AccountUPN), tolower(tostring(split(MailAddress, "@")[1])))
+        | mv-expand D = Ds to typeof(string)),
+    (AuditLogs
+        | where TimeGenerated between (ago(BaselineLookback) .. ago(DetectionWindow))
+        | where OperationName =~ "Add user"
+        | where Result =~ "success"
+        | mv-apply tr = TargetResources on (
+            where tostring(tr.type) =~ "User"
+            | project TU = tostring(tr.userPrincipalName)
+          )
+        | project D = HomeDomain(TU))
+    | where isnotempty(D)
+    | distinct D;
+// Second-level labels of your own member domains, for the lookalike check
+let TenantLabels = toscalar(
+    IdentityInfo
+    | where TimeGenerated > ago(IdentityLookback)
+    | where UserType =~ "Member"
+    | where AccountUPN !contains "#EXT#"
+    | extend D = tolower(tostring(split(AccountUPN, "@")[1]))
+    | extend L = tostring(split(D, ".")[0])
+    | where strlen(L) >= 5
+    | summarize make_set(L, 50));
+// Domain and federation configuration changes; a new domain matching one of these is the follow-on
+let DomainOps = AuditLogs
+    | where TimeGenerated > ago(DomainOpsLookback)
+    | where OperationName in~ ("Add verified domain", "Add unverified domain", "Verify domain",
+                               "Set federation settings on domain", "Set domain authentication")
+    | mv-apply tr = TargetResources on (
+        project OpDomain = tolower(tostring(tr.displayName))
+      )
+    | where isnotempty(OpDomain)
+    | summarize DomainOpNames = make_set(OperationName, 10), LastDomainOp = max(TimeGenerated) by OpDomain;
+// Successful account creations in the detection window whose source domain is new to the tenant
+AuditLogs
+| where TimeGenerated > ago(DetectionWindow)
+| where OperationName =~ "Add user"
+| where Result =~ "success"
+| extend InitiatorUPN = tolower(tostring(InitiatedBy.user.userPrincipalName))
+| extend InitiatorApp = tostring(InitiatedBy.app.displayName)
+| extend Initiator = iff(isnotempty(InitiatorUPN), InitiatorUPN, InitiatorApp)
+| extend InitiatorType = iff(isnotempty(InitiatorUPN), "User", "App")
+| extend InitiatorIp = iff(isnotempty(tostring(InitiatedBy.user.ipAddress)), tostring(InitiatedBy.user.ipAddress), tostring(InitiatedBy.app.ipAddress))
+| where isnotempty(Initiator)
+| mv-apply tr = TargetResources on (
+    where tostring(tr.type) =~ "User"
+    | project TargetUPN = tolower(tostring(tr.userPrincipalName)), TargetId = tostring(tr.id)
+  )
+| extend NewDomain = HomeDomain(TargetUPN)
+| where isnotempty(NewDomain)
+| where NewDomain !in (KnownDomains)
+| extend IsGuestTarget = TargetUPN contains "#EXT#"
+| extend HourOfDay = datetime_part("Hour", TimeGenerated)
+| extend OffHoursEvent = HourOfDay < BusinessStart or HourOfDay >= BusinessEnd or dayofweek(TimeGenerated) in (0d, 6d)
+| summarize
+    StartTime = min(TimeGenerated),
+    EndTime = max(TimeGenerated),
+    CreatedCount = dcount(TargetId),
+    MemberCount = dcountif(TargetId, IsGuestTarget == false),
+    SampleTargets = make_set(TargetUPN, 10),
+    OffHoursCount = countif(OffHoursEvent),
+    IpSet = make_set(InitiatorIp, 10),
+    PrimaryIp = take_any(InitiatorIp)
+  by NewDomain, Initiator, InitiatorType, InitiatorApp
+| join kind=leftouter DomainOps on $left.NewDomain == $right.OpDomain
+| extend InviterIsGuest = Initiator contains "#EXT#"
+| extend sMember = MemberCount > 0
+| extend sDomainOp = isnotempty(LastDomainOp)
+| extend sLookalike = NewDomain has_any (TenantLabels)
+| extend sBulk = CreatedCount >= BulkDomainThreshold
+| extend sGuestInviter = InviterIsGuest
+| extend sFreeMail = NewDomain in~ (FreeMailDomains)
+| extend sOffHours = OffHoursCount > 0
+| extend RiskScore =
+      iff(sMember, W_MemberDomain, 0)
+    + iff(sDomainOp, W_DomainConfig, 0)
+    + iff(sLookalike, W_Lookalike, 0)
+    + iff(sBulk, W_BulkDomain, 0)
+    + iff(sGuestInviter, W_GuestInviter, 0)
+    + iff(sFreeMail, W_FreeMail, 0)
+    + iff(sOffHours, W_OffHours, 0)
+| where RiskScore >= FireThreshold
+| extend Name = tostring(split(Initiator, "@", 0)[0]), UPNSuffix = tostring(split(Initiator, "@", 1)[0])
+| extend Risk_1 = iff(sMember, "MemberOnNewDomain", "")
+| extend Risk_2 = iff(sDomainOp, "DomainConfigChange", "")
+| extend Risk_3 = iff(sLookalike, "LookalikeDomain", "")
+| extend Risk_4 = iff(sBulk, "BulkFromNewDomain", "")
+| extend Risk_5 = iff(sGuestInviter, "GuestInviter", "")
+| extend Risk_6 = iff(sFreeMail, "ConsumerMailDomain", "")
+| extend Risk_7 = iff(sOffHours, "OffHoursActivity", "")
+| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
+    iff(isnotempty(Risk_1), strcat(Risk_1, " | "), ""),
+    iff(isnotempty(Risk_2), strcat(Risk_2, " | "), ""),
+    iff(isnotempty(Risk_3), strcat(Risk_3, " | "), ""),
+    iff(isnotempty(Risk_4), strcat(Risk_4, " | "), ""),
+    iff(isnotempty(Risk_5), strcat(Risk_5, " | "), ""),
+    iff(isnotempty(Risk_6), strcat(Risk_6, " | "), ""),
+    iff(isnotempty(Risk_7), strcat(Risk_7, " | "), "")
+))
+| extend DomainConfigOps = iff(sDomainOp, strcat_array(DomainOpNames, " / "), "")
+| extend LookalikeHit = sLookalike
+| project
+    StartTime, EndTime, RiskScore, RiskIndicators,
+    NewDomain, Initiator, Name, UPNSuffix, InitiatorType, PrimaryIp, IpSet,
+    CreatedCount, MemberCount, SampleTargets,
+    DomainConfigOps, LookalikeHit, InviterIsGuest, OffHoursCount
+| sort by RiskScore desc, EndTime desc
