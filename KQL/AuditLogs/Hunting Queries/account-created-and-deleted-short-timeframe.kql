@@ -1,0 +1,114 @@
+// =====================================================================
+// Account Created and Deleted in Short Timeframe - Entra ID
+// =====================================================================
+// Description : Pairs a user-account deletion with its earlier creation and surfaces it only when
+//               the short-lived account actually did something: signed in, or was granted a
+//               directory role during its life. A create/delete pair with no activity is treated
+//               as lifecycle churn and suppressed. Shortness of life and a single human running
+//               the whole lifecycle add weight.
+// Type        : Detection
+//
+// Tables      : AuditLogs, SigninLogs, AADNonInteractiveUserSignInLogs
+// Connectors  : Microsoft Entra ID (AuditLogs, SignInLogs, NonInteractiveUserSignInLogs)
+// License     : Microsoft Sentinel
+//
+// Tuning      : - DetectionWindow - recent deletions to evaluate; align to run frequency
+//               - LookbackWindow - how far back to find the creation and in-life activity
+//               - VeryShortLife / ShortLife - the two lifetime tiers
+//               - PrivilegedRoleOps - directory-role operations that count as escalation; extend for
+//                 privileged groups, app consent, or credential adds if those paths matter to you
+//               - W_* weights and ScoreThreshold - shift these to fit your environment
+//
+// Known FPs   : - Provisioning / HR-sync rollbacks - created and deleted with no activity, suppressed
+//               - B2B guest invited and removed without signing in - no activity, suppressed
+//               - An admin error: account created, used briefly, removed same day - low volume, expected
+//
+// Author      : Bartosz Wysocki | https://www.itprofessor.cloud
+// Version     : 1.0 | 2026-06-17
+// =====================================================================
+let DetectionWindow = 1h;        // recent deletions that trigger evaluation
+let LookbackWindow = 7d;         // window to find the matching creation and any in-life activity
+let VeryShortLife = 1h;
+let ShortLife = 24h;
+let PrivilegedRoleOps = dynamic(["Add member to role", "Add eligible member to role"]);
+// Scoring weights - activity carries the most; shortness and a single human actor add to it
+let W_VeryShortLife = 3;
+let W_ShortLife     = 2;
+let W_SignedIn      = 3;
+let W_RoleGranted   = 4;
+let W_SameUserActor = 2;
+let ScoreThreshold  = 4;
+// User-account deletions in the recent window
+let Deletions = AuditLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where OperationName =~ "Delete user"
+    | mv-apply tr = TargetResources on (
+        where tostring(tr.type) =~ "User"
+        | extend UserId = tostring(tr.id), TargetUPN = tolower(tostring(tr.userPrincipalName))
+      )
+    | extend DeletedByUser = tolower(tostring(InitiatedBy.user.userPrincipalName)),
+             DeletedByApp = tostring(InitiatedBy.app.displayName),
+             DeletedByIP = tostring(InitiatedBy.user.ipAddress)
+    | project DeletionTime = TimeGenerated, UserId, TargetUPN, DeletedByUser, DeletedByApp, DeletedByIP;
+// User-account creations in the lookback
+let Creations = AuditLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where OperationName =~ "Add user"
+    | mv-apply tr = TargetResources on (
+        where tostring(tr.type) =~ "User"
+        | extend UserId = tostring(tr.id)
+      )
+    | extend CreatedByUser = tolower(tostring(InitiatedBy.user.userPrincipalName)),
+             CreatedByApp = tostring(InitiatedBy.app.displayName),
+             CreatedByIP = tostring(InitiatedBy.user.ipAddress)
+    | project CreationTime = TimeGenerated, UserId, CreatedByUser, CreatedByApp, CreatedByIP;
+// Create/delete pairs with a positive lifetime inside the window
+let Pairs = materialize(
+    Deletions
+    | join kind=inner Creations on UserId
+    | extend Lifetime = DeletionTime - CreationTime
+    | where Lifetime between (time(0s) .. LookbackWindow));
+// Restrict the activity scans to just the short-lived accounts (keeps the query cheap)
+let CandidateIds = toscalar(Pairs | summarize make_set(UserId, 1000));
+// Did the account sign in? It could only have done so during its life
+let SignInActivity = union isfuzzy=true
+    (SigninLogs | where TimeGenerated > ago(LookbackWindow) | where UserId in (CandidateIds) | project UserId, IPAddress),
+    (AADNonInteractiveUserSignInLogs | where TimeGenerated > ago(LookbackWindow) | where UserId in (CandidateIds) | project UserId, IPAddress)
+    | summarize SignInCount = count(), SignInIPs = make_set(IPAddress, 20) by UserId;
+// Was it granted a directory role during its life?
+let RoleGrantActivity = AuditLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where OperationName in~ (PrivilegedRoleOps)
+    | mv-apply tr = TargetResources on (
+        where tostring(tr.type) =~ "User"
+        | extend UserId = tostring(tr.id)
+      )
+    | where UserId in (CandidateIds)
+    | summarize RoleGrantCount = count(), RoleOps = make_set(OperationName, 5) by UserId;
+Pairs
+| join kind=leftouter SignInActivity on UserId
+| join kind=leftouter RoleGrantActivity on UserId
+| extend SignedIn = coalesce(SignInCount, 0) > 0
+| extend RoleGranted = coalesce(RoleGrantCount, 0) > 0
+| extend SameUserActor = isnotempty(CreatedByUser) and CreatedByUser == DeletedByUser
+| extend LifeWeight = case(Lifetime < VeryShortLife, W_VeryShortLife, Lifetime < ShortLife, W_ShortLife, 0)
+| extend Score = LifeWeight
+               + toint(SignedIn)      * W_SignedIn
+               + toint(RoleGranted)   * W_RoleGranted
+               + toint(SameUserActor) * W_SameUserActor
+| where Score >= ScoreThreshold
+| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
+    iff(Lifetime < VeryShortLife, "VeryShortLife | ", iff(Lifetime < ShortLife, "ShortLife | ", "")),
+    iff(SignedIn, "SignedInDuringLife | ", ""),
+    iff(RoleGranted, "RoleGrantedDuringLife | ", ""),
+    iff(SameUserActor, "SameUserActor | ", "")
+))
+| extend TargetName = tostring(split(TargetUPN, "@", 0)[0]), TargetUPNSuffix = tostring(split(TargetUPN, "@", 1)[0])
+| extend CreatedByName = tostring(split(CreatedByUser, "@", 0)[0]), CreatedByUPNSuffix = tostring(split(CreatedByUser, "@", 1)[0])
+| project
+    CreationTime, DeletionTime, Lifetime, Score, RiskIndicators,
+    TargetUPN, TargetName, TargetUPNSuffix, UserId,
+    SignInCount, SignInIPs, RoleOps,
+    CreatedByUser, CreatedByName, CreatedByUPNSuffix, CreatedByApp, CreatedByIP,
+    DeletedByUser, DeletedByApp, DeletedByIP
+| sort by Score desc, Lifetime asc

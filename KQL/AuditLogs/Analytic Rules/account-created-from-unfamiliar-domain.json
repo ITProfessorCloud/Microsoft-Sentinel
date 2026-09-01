@@ -1,0 +1,116 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/account-created-from-unfamiliar-domain')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/account-created-from-unfamiliar-domain')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "Account Created From Unfamiliar Domain",
+                "description": "Detects accounts created with a source domain never seen in the tenant, scored by what makes the novelty dangerous rather than firing on novelty alone. The baseline is the standing directory (IdentityInfo UPN and mail domains) plus prior creation history, not sign-ins, so an attacker cannot approve their own domain by authenticating with it. A weighted RiskScore gates alerting: a bare first-time partner guest scores zero and stays silent; the rule fires on a member account appearing on a domain the tenant never had, a recent verified-domain or federation configuration change matching the new domain, a lookalike of your own domain labels, bulk creation from one new domain, a guest initiator, consumer mail sources and off-hours timing stacking with the rest.\n\nTABLES: AuditLogs, IdentityInfo\nCONNECTORS: Microsoft Entra ID (AuditLogs); Microsoft Sentinel UEBA (IdentityInfo)\nLICENSE: Microsoft Sentinel; Microsoft Entra ID P1 (audit logs); P2 recommended (UEBA / IdentityInfo baseline)\n\nTUNING:\n1. Query period must be P14D - the 14d baselines only resolve if the rule looks back that far.\n2. BulkDomainThreshold - distinct accounts from one new domain that count as bulk; align to real onboarding.\n3. FreeMailDomains - consumer mail providers; empty the list if consumer-mail guests are routine.\n4. W_GuestInviter - raise it if guests cannot invite in your tenant, so any hit fires alone.\n5. BusinessStart / BusinessEnd - local working hours; TimeGenerated is UTC, shift to your tenant.\n6. TenantLabels strlen filter - raise from 5 if your domain labels are short and generic.\n\nKNOWN FALSE POSITIVES:\n1. Planned onboarding of a new brand or partner domain - fires once, then the domain enters the baseline; close as expected change.\n2. Cross-tenant synchronisation onboarding a partner tenant - bulk novel-domain accounts; exclude the sync principal or accept one incident per new partner.\n3. Contractors on consumer mail - amplifier only; zero the FreeMail weight if routine.\n\nINVESTIGATION STEPS:\n1. Read RiskIndicators to see which signals fired and start with the heaviest.\n2. MemberOnNewDomain or DomainConfigChange: pull the AuditLogs domain and federation operations for the domain and confirm change control.\n3. LookalikeDomain: compare the new domain to your own domains character by character and check registration age.\n4. Confirm the initiator session: IP, location and MFA for the creation events.\n5. Review SampleTargets for role assignments, group adds and application consents after creation.\n6. If malicious: remove the accounts, revoke initiator sessions, and roll back any domain or federation change.\n\nBLIND SPOTS:\nHomoglyph lookalikes (zero for o) pass the label check. Once a domain fires it enters the baseline, so repeat waves from the same domain rely on incident follow-up, not re-alerting. Empowerment of a quiet novel-domain guest is the companion rule (privileged role on a new account). On-premises account creation (4720) is out of scope.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 1.0 | 2026-07-02",
+                "severity": "Medium",
+                "enabled": true,
+                "query": "// =====================================================================\n// Account Created From Unfamiliar Domain - Entra ID\n// =====================================================================\n// Tables : AuditLogs, IdentityInfo\n// License : Microsoft Sentinel; Entra ID P1 (audit logs), P2 recommended (UEBA / IdentityInfo)\n// Tuning : see rule description for full tuning notes\n// Author : Bartosz Wysocki | itprofessor.cloud\n// Version : 1.0 | 2026-07-02\n// =====================================================================\nlet DetectionWindow = 1h;\nlet BaselineLookback = 14d; // prior creation history for the domain baseline\nlet IdentityLookback = 14d; // full UEBA sync cycle; the standing directory population\nlet DomainOpsLookback = 14d; // window for verified-domain and federation configuration changes\nlet BulkDomainThreshold = 3; // distinct accounts from one new domain that count as bulk\nlet BusinessStart = 7;\nlet BusinessEnd = 19;\nlet FireThreshold = 4;\n// Scoring weights - the impossible-without-a-verified-domain case and the config follow-on carry the most\nlet W_MemberDomain = 6; // member account on a domain the tenant never had\nlet W_DomainConfig = 5; // the new domain matches a recent domain or federation configuration change\nlet W_Lookalike = 4; // the new domain contains one of your own domain labels\nlet W_BulkDomain = 4; // bulk creation from a single new domain\nlet W_GuestInviter = 3; // the initiator is itself a guest account\nlet W_FreeMail = 2; // consumer mail source domain\nlet W_OffHours = 1; // activity outside working hours\nlet FreeMailDomains = dynamic([\n\"gmail.com\", \"googlemail.com\", \"outlook.com\", \"hotmail.com\", \"live.com\",\n\"yahoo.com\", \"icloud.com\", \"proton.me\", \"protonmail.com\", \"aol.com\",\n\"gmx.com\", \"mail.com\", \"yandex.com\"\n]);\n// Home domain of a UPN. Invited guests carry the mangled form (the address's @ becomes the final\n// underscore before #EXT#), so take the last segment; plain addresses split on @. Handles both shapes.\nlet HomeDomain = (u:string) {\n tolower(iff(u contains \"#EXT#\", extract(@\"_([^_]+)#EXT#\", 1, u), tostring(split(u, \"@\")[1])))\n};\n// Every domain the tenant already knows: the standing directory (UPN and mail) plus accounts\n// created earlier in the lookback, excluding the current window so creations cannot self-baseline\nlet KnownDomains = union\n (IdentityInfo\n | where TimeGenerated > ago(IdentityLookback)\n | extend Ds = pack_array(HomeDomain(AccountUPN), tolower(tostring(split(MailAddress, \"@\")[1])))\n | mv-expand D = Ds to typeof(string)),\n (AuditLogs\n | where TimeGenerated between (ago(BaselineLookback) .. ago(DetectionWindow))\n | where OperationName =~ \"Add user\"\n | where Result =~ \"success\"\n | mv-apply tr = TargetResources on (\n where tostring(tr.type) =~ \"User\"\n | project TU = tostring(tr.userPrincipalName)\n )\n | project D = HomeDomain(TU))\n | where isnotempty(D)\n | distinct D;\n// Second-level labels of your own member domains, for the lookalike check\nlet TenantLabels = toscalar(\n IdentityInfo\n | where TimeGenerated > ago(IdentityLookback)\n | where UserType =~ \"Member\"\n | where AccountUPN !contains \"#EXT#\"\n | extend D = tolower(tostring(split(AccountUPN, \"@\")[1]))\n | extend L = tostring(split(D, \".\")[0])\n | where strlen(L) >= 5\n | summarize make_set(L, 50));\n// Domain and federation configuration changes; a new domain matching one of these is the follow-on\nlet DomainOps = AuditLogs\n | where TimeGenerated > ago(DomainOpsLookback)\n | where OperationName in~ (\"Add verified domain\", \"Add unverified domain\", \"Verify domain\",\n \"Set federation settings on domain\", \"Set domain authentication\")\n | mv-apply tr = TargetResources on (\n project OpDomain = tolower(tostring(tr.displayName))\n )\n | where isnotempty(OpDomain)\n | summarize DomainOpNames = make_set(OperationName, 10), LastDomainOp = max(TimeGenerated) by OpDomain;\n// Successful account creations in the detection window whose source domain is new to the tenant\nAuditLogs\n| where TimeGenerated > ago(DetectionWindow)\n| where OperationName =~ \"Add user\"\n| where Result =~ \"success\"\n| extend InitiatorUPN = tolower(tostring(InitiatedBy.user.userPrincipalName))\n| extend InitiatorApp = tostring(InitiatedBy.app.displayName)\n| extend Initiator = iff(isnotempty(InitiatorUPN), InitiatorUPN, InitiatorApp)\n| extend InitiatorType = iff(isnotempty(InitiatorUPN), \"User\", \"App\")\n| extend InitiatorIp = iff(isnotempty(tostring(InitiatedBy.user.ipAddress)), tostring(InitiatedBy.user.ipAddress), tostring(InitiatedBy.app.ipAddress))\n| where isnotempty(Initiator)\n| mv-apply tr = TargetResources on (\n where tostring(tr.type) =~ \"User\"\n | project TargetUPN = tolower(tostring(tr.userPrincipalName)), TargetId = tostring(tr.id)\n )\n| extend NewDomain = HomeDomain(TargetUPN)\n| where isnotempty(NewDomain)\n| where NewDomain !in (KnownDomains)\n| extend IsGuestTarget = TargetUPN contains \"#EXT#\"\n| extend HourOfDay = datetime_part(\"Hour\", TimeGenerated)\n| extend OffHoursEvent = HourOfDay < BusinessStart or HourOfDay >= BusinessEnd or dayofweek(TimeGenerated) in (0d, 6d)\n| summarize\n StartTime = min(TimeGenerated),\n EndTime = max(TimeGenerated),\n CreatedCount = dcount(TargetId),\n MemberCount = dcountif(TargetId, IsGuestTarget == false),\n SampleTargets = make_set(TargetUPN, 10),\n OffHoursCount = countif(OffHoursEvent),\n IpSet = make_set(InitiatorIp, 10),\n PrimaryIp = take_any(InitiatorIp)\n by NewDomain, Initiator, InitiatorType, InitiatorApp\n| join kind=leftouter DomainOps on $left.NewDomain == $right.OpDomain\n| extend InviterIsGuest = Initiator contains \"#EXT#\"\n| extend sMember = MemberCount > 0\n| extend sDomainOp = isnotempty(LastDomainOp)\n| extend sLookalike = NewDomain has_any (TenantLabels)\n| extend sBulk = CreatedCount >= BulkDomainThreshold\n| extend sGuestInviter = InviterIsGuest\n| extend sFreeMail = NewDomain in~ (FreeMailDomains)\n| extend sOffHours = OffHoursCount > 0\n| extend RiskScore =\n iff(sMember, W_MemberDomain, 0)\n + iff(sDomainOp, W_DomainConfig, 0)\n + iff(sLookalike, W_Lookalike, 0)\n + iff(sBulk, W_BulkDomain, 0)\n + iff(sGuestInviter, W_GuestInviter, 0)\n + iff(sFreeMail, W_FreeMail, 0)\n + iff(sOffHours, W_OffHours, 0)\n| where RiskScore >= FireThreshold\n| extend Name = tostring(split(Initiator, \"@\", 0)[0]), UPNSuffix = tostring(split(Initiator, \"@\", 1)[0])\n| extend Risk_1 = iff(sMember, \"MemberOnNewDomain\", \"\")\n| extend Risk_2 = iff(sDomainOp, \"DomainConfigChange\", \"\")\n| extend Risk_3 = iff(sLookalike, \"LookalikeDomain\", \"\")\n| extend Risk_4 = iff(sBulk, \"BulkFromNewDomain\", \"\")\n| extend Risk_5 = iff(sGuestInviter, \"GuestInviter\", \"\")\n| extend Risk_6 = iff(sFreeMail, \"ConsumerMailDomain\", \"\")\n| extend Risk_7 = iff(sOffHours, \"OffHoursActivity\", \"\")\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n iff(isnotempty(Risk_1), strcat(Risk_1, \" | \"), \"\"),\n iff(isnotempty(Risk_2), strcat(Risk_2, \" | \"), \"\"),\n iff(isnotempty(Risk_3), strcat(Risk_3, \" | \"), \"\"),\n iff(isnotempty(Risk_4), strcat(Risk_4, \" | \"), \"\"),\n iff(isnotempty(Risk_5), strcat(Risk_5, \" | \"), \"\"),\n iff(isnotempty(Risk_6), strcat(Risk_6, \" | \"), \"\"),\n iff(isnotempty(Risk_7), strcat(Risk_7, \" | \"), \"\")\n))\n| extend DomainConfigOps = iff(sDomainOp, strcat_array(DomainOpNames, \" / \"), \"\")\n| extend LookalikeHit = sLookalike\n| project\n StartTime, EndTime, RiskScore, RiskIndicators,\n NewDomain, Initiator, Name, UPNSuffix, InitiatorType, PrimaryIp, IpSet,\n CreatedCount, MemberCount, SampleTargets,\n DomainConfigOps, LookalikeHit, InviterIsGuest, OffHoursCount\n| sort by RiskScore desc, EndTime desc\n",
+                "queryFrequency": "PT1H",
+                "queryPeriod": "P14D",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": [
+                    "Persistence",
+                    "InitialAccess",
+                    "DefenseEvasion"
+                ],
+                "techniques": [
+                    "T1136",
+                    "T1199",
+                    "T1484"
+                ],
+                "subTechniques": [
+                    "T1136.003",
+                    "T1484.002"
+                ],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT8H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": [
+                            "Account"
+                        ],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": null
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "AlertPerResult"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "Account created from unfamiliar domain {{NewDomain}}",
+                    "alertDescriptionFormat": "{{CreatedCount}} account(s) created from previously unseen source domain {{NewDomain}}. Risk indicators: {{RiskIndicators}}"
+                },
+                "customDetails": {
+                    "RiskScore": "RiskScore",
+                    "RiskIndicators": "RiskIndicators",
+                    "NewDomain": "NewDomain",
+                    "CreatedCount": "CreatedCount",
+                    "MemberCount": "MemberCount",
+                    "SampleTargets": "SampleTargets",
+                    "DomainConfigOps": "DomainConfigOps",
+                    "LookalikeHit": "LookalikeHit",
+                    "InviterIsGuest": "InviterIsGuest",
+                    "InitiatorType": "InitiatorType",
+                    "OffHoursCount": "OffHoursCount"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "Name"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "UPNSuffix"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "PrimaryIp"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "DNS",
+                        "fieldMappings": [
+                            {
+                                "identifier": "DomainName",
+                                "columnName": "NewDomain"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}

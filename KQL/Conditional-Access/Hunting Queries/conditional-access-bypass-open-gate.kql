@@ -1,0 +1,211 @@
+// =====================================================================
+// Conditional Access Bypass - True Fail-Open or Anomalous Legacy Auth
+// Version : 2.1 | union type-collision fix
+// =====================================================================
+let DetectionWindow   = 1h;
+let BaselineWindow    = 14d;
+let BaselineCutoff    = 2d;
+let MinBaselineHits   = 3;
+let FireThreshold     = 50;
+let GrindThreshold    = 5;
+let LegacyAuthClients = dynamic(["Other clients","IMAP4","POP3","SMTP","Authenticated SMTP",
+                                 "MAPI","Exchange ActiveSync","Exchange Web Services",
+                                 "Exchange Online PowerShell","AutoDiscover"]);
+let HighRiskLegacy    = dynamic(["Other clients","IMAP4","POP3","Exchange Online PowerShell"]);
+let BenignErrorCodes  = dynamic(["50140"]);
+let KnownServiceUPNs  = dynamic([]);
+let W_FailOpen        = 60;
+let W_NewClient       = 40;
+let W_NewNetwork      = 25;
+let W_HighRiskClient  = 15;
+let W_SignInRisk      = 30;
+let W_SingleFactor    = 15;
+let W_Privileged      = 25;
+let W_Grind           = 15;
+let W_ServiceAcct     = -40;
+let W_AppPassword     = -25;
+// --- Leg 1: interactive. Flatten to scalars (inside) ---
+let LegacyInteractive =
+    SigninLogs
+    | where TimeGenerated > ago(BaselineWindow)
+    | where ResultType == "0"
+    | where ClientAppUsed in~ (LegacyAuthClients)
+    | extend DevJson = todynamic(DeviceDetail),
+             LocJson = todynamic(LocationDetails),
+             StsJson = todynamic(Status)
+    | project TimeGenerated, UserId, UserPrincipalName, ClientAppUsed, AppDisplayName,
+              ResourceDisplayName, IPAddress, ResultDescription, ConditionalAccessStatus,
+              AuthenticationRequirement, RiskLevelDuringSignIn, RiskState, CorrelationId, Id,
+              OS              = tostring(DevJson.operatingSystem),
+              Browser         = tostring(DevJson.browser),
+              DeviceId        = tostring(DevJson.deviceId),
+              IsCompliant     = tostring(DevJson.isCompliant),
+              City            = tostring(LocJson.city),
+              Country         = tostring(LocJson.countryOrRegion),
+              StatusErrorCode = tostring(StsJson.errorCode),
+              StatusDetails   = tostring(StsJson.additionalDetails),
+              SourceTable     = "SigninLogs";
+// ---2: non-interactive
+let LegacyNonInteractive =
+    AADNonInteractiveUserSignInLogs
+    | where TimeGenerated > ago(BaselineWindow)
+    | where ResultType == "0"
+    | where ClientAppUsed in~ (LegacyAuthClients)
+    | extend DevJson = todynamic(DeviceDetail),
+             LocJson = todynamic(LocationDetails),
+             StsJson = todynamic(Status)
+    | project TimeGenerated, UserId, UserPrincipalName, ClientAppUsed, AppDisplayName,
+              ResourceDisplayName, IPAddress, ResultDescription, ConditionalAccessStatus,
+              AuthenticationRequirement, RiskLevelDuringSignIn, RiskState, CorrelationId, Id,
+              OS              = tostring(DevJson.operatingSystem),
+              Browser         = tostring(DevJson.browser),
+              DeviceId        = tostring(DevJson.deviceId),
+              IsCompliant     = tostring(DevJson.isCompliant),
+              City            = tostring(LocJson.city),
+              Country         = tostring(LocJson.countryOrRegion),
+              StatusErrorCode = tostring(StsJson.errorCode),
+              StatusDetails   = tostring(StsJson.additionalDetails),
+              SourceTable     = "AADNonInteractiveUserSignInLogs";
+let LegacySlice = materialize(
+    union isfuzzy=true LegacyInteractive, LegacyNonInteractive
+    | where UserPrincipalName !in~ (KnownServiceUPNs)
+    | extend NetworkPrefix = iff(IPAddress contains ":",
+                 strcat(strcat_array(array_slice(split(IPAddress, ":"), 0, 2), ":"), "::"),
+                 strcat_array(array_slice(split(IPAddress, "."), 0, 2), "."))
+);
+let ClientBaseline = LegacySlice
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(BaselineCutoff))
+    | summarize Hits = count() by UserId, ClientAppUsed
+    | where Hits >= MinBaselineHits
+    | project UserId, ClientAppUsed;
+let NetworkBaseline = LegacySlice
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(BaselineCutoff))
+    | summarize Hits = count() by UserId, ClientAppUsed, NetworkPrefix
+    | where Hits >= MinBaselineHits
+    | project UserId, ClientAppUsed, NetworkPrefix;
+let RecentLegacy = LegacySlice | where TimeGenerated > ago(DetectionWindow);
+// --- Branch A: legacy protocol this identity has never used ---
+let NewClientHits = RecentLegacy
+    | join kind=leftanti ClientBaseline on UserId, ClientAppUsed
+    | extend Signal = "NewLegacyClient", FailedPolicy = "";
+// --- Branch B: established legacy user, high-risk protocol, unseen infrastructure
+let NewNetworkHits = RecentLegacy
+    | join kind=leftanti NetworkBaseline on UserId, ClientAppUsed, NetworkPrefix
+    | join kind=leftsemi ClientBaseline on UserId, ClientAppUsed
+    | where ClientAppUsed in~ (HighRiskLegacy)
+    | extend Signal = "LegacyFromNewNet", FailedPolicy = "";
+// --- Branch C: true fail-open. SigninLogs only
+let FailOpenHits =
+    SigninLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where ResultType == "0"
+    | where ConditionalAccessStatus =~ "failure"
+    | extend DevJson = todynamic(DeviceDetail),
+             LocJson = todynamic(LocationDetails),
+             StsJson = todynamic(Status)
+    | mv-apply CAP = todynamic(ConditionalAccessPolicies) on (
+        where tostring(CAP.result) =~ "failure"
+              and isnotempty(CAP.enforcedGrantControls)
+              and tostring(CAP.enforcedGrantControls) !has "Block"
+        | project FailedPolicy = tostring(CAP.displayName)
+      )
+    | project TimeGenerated, UserId, UserPrincipalName, ClientAppUsed, AppDisplayName,
+              ResourceDisplayName, IPAddress, ResultDescription, ConditionalAccessStatus,
+              AuthenticationRequirement, RiskLevelDuringSignIn, RiskState, CorrelationId, Id,
+              OS              = tostring(DevJson.operatingSystem),
+              Browser         = tostring(DevJson.browser),
+              DeviceId        = tostring(DevJson.deviceId),
+              IsCompliant     = tostring(DevJson.isCompliant),
+              City            = tostring(LocJson.city),
+              Country         = tostring(LocJson.countryOrRegion),
+              StatusErrorCode = tostring(StsJson.errorCode),
+              StatusDetails   = tostring(StsJson.additionalDetails),
+              SourceTable     = "SigninLogs",
+              NetworkPrefix   = "",
+              FailedPolicy,
+              Signal          = "CAFailOpen";
+// --- Context ---
+let GrindBaseline = materialize(
+    SigninLogs
+    | where TimeGenerated > ago(1d)
+    | where ConditionalAccessStatus =~ "failure"
+    | summarize PriorCAFailures = count(), DistinctFailIPs = dcount(IPAddress) by UserId
+);
+let IdentityContext = materialize(
+    IdentityInfo
+    | where TimeGenerated > ago(BaselineWindow)
+    | summarize arg_max(TimeGenerated, AccountUPN, AccountCreationTime, Department, JobTitle,
+                        Manager, AssignedRoles, IsMFARegistered, IsAccountEnabled,
+                        IsServiceAccount, UserType) by AccountUPN
+    | extend UPNKey = tolower(AccountUPN),
+             PrivilegedTarget = array_length(todynamic(AssignedRoles)) > 0
+    | project UPNKey, AccountCreationTime, Department, JobTitle, Manager, AssignedRoles,
+              IsMFARegistered, IsAccountEnabled, IsServiceAccount, UserType, PrivilegedTarget
+);
+union isfuzzy=true NewClientHits, NewNetworkHits, FailOpenHits
+| where StatusErrorCode !in (BenignErrorCodes)
+| extend UPNKey = tolower(UserPrincipalName)
+| lookup kind=leftouter (IdentityContext) on UPNKey
+| lookup kind=leftouter (GrindBaseline) on UserId
+| extend PriorCAFailures = coalesce(PriorCAFailures, 0),
+         DistinctFailIPs = coalesce(DistinctFailIPs, 0)
+| extend W1  = iff(Signal == "CAFailOpen", W_FailOpen, 0),
+         W2  = iff(Signal == "NewLegacyClient", W_NewClient, 0),
+         W3  = iff(Signal == "LegacyFromNewNet", W_NewNetwork, 0),
+         W4  = iff(ClientAppUsed in~ (HighRiskLegacy), W_HighRiskClient, 0),
+         W5  = iff(tolower(RiskLevelDuringSignIn) in ("high", "medium"), W_SignInRisk, 0),
+         W6  = iff(AuthenticationRequirement =~ "singleFactorAuthentication", W_SingleFactor, 0),
+         W7  = iff(PrivilegedTarget == true, W_Privileged, 0),
+         W8  = iff(PriorCAFailures >= GrindThreshold, W_Grind, 0),
+         W9  = iff(IsServiceAccount == true, W_ServiceAcct, 0),
+         W10 = iff(StatusDetails has "app password", W_AppPassword, 0)
+| summarize
+    FirstSeen     = min(TimeGenerated),
+    TimeGenerated = max(TimeGenerated),
+    EventCount    = count(),
+    SampleIP      = take_any(IPAddress),
+    IPAddresses   = make_set(IPAddress, 10),
+    Countries     = make_set(Country, 5),
+    Cities        = make_set(City, 5),
+    Apps          = make_set(AppDisplayName, 10),
+    Resources     = make_set(ResourceDisplayName, 10),
+    Policies      = make_set_if(FailedPolicy, isnotempty(FailedPolicy), 5),
+    Devices       = make_set_if(DeviceId, isnotempty(DeviceId), 5),
+    StatusDetail  = take_any(StatusDetails),
+    RolesHeld     = take_any(AssignedRoles),
+    CorrelationId = take_any(CorrelationId),
+    SourceTables  = make_set(SourceTable, 3),
+    W1 = max(W1), W2 = max(W2), W3 = max(W3), W4 = max(W4), W5 = max(W5),
+    W6 = max(W6), W7 = max(W7), W8 = max(W8), W9 = min(W9), W10 = min(W10)
+    by UserPrincipalName, UserId, Signal, ClientAppUsed, ConditionalAccessStatus,
+       AuthenticationRequirement, Department, JobTitle, Manager, IsMFARegistered,
+       IsAccountEnabled, IsServiceAccount, UserType, PrivilegedTarget,
+       AccountCreationTime, PriorCAFailures, DistinctFailIPs
+| extend RiskScore = W1 + W2 + W3 + W4 + W5 + W6 + W7 + W8 + W9 + W10
+| where RiskScore >= FireThreshold
+| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
+    iff(W1 != 0, "CAControlFailedButAllowed | ", ""),
+    iff(W2 != 0, "FirstEverLegacyClient | ", ""),
+    iff(W3 != 0, "LegacyFromNewNetwork | ", ""),
+    iff(W4 != 0, "HighRiskLegacyProtocol | ", ""),
+    iff(W5 != 0, "ElevatedSignInRisk | ", ""),
+    iff(W6 != 0, "SingleFactorOnly | ", ""),
+    iff(W7 != 0, "PrivilegedTarget | ", ""),
+    iff(W8 != 0, "PrecededByFailures | ", ""),
+    iff(W9 != 0, "SuppressServiceAcct | ", ""),
+    iff(W10 != 0, "SuppressAppPassword | ", "")
+))
+| extend TargetAccountAgeDays = datetime_diff('day', now(), AccountCreationTime),
+         Name      = tostring(split(UserPrincipalName, "@")[0]),
+         UPNSuffix = tostring(split(UserPrincipalName, "@")[1])
+| project
+    TimeGenerated, FirstSeen, Signal, RiskScore, RiskIndicators, EventCount,
+    UserPrincipalName, Name, UPNSuffix, UserId,
+    ClientAppUsed, Apps, Resources, Policies,
+    ConditionalAccessStatus, AuthenticationRequirement,
+    IPAddress = SampleIP, IPAddresses, Cities, Countries, Devices, StatusDetail,
+    PriorCAFailures, DistinctFailIPs,
+    Department, JobTitle, Manager, RolesHeld, PrivilegedTarget,
+    IsMFARegistered, IsAccountEnabled, IsServiceAccount, UserType,
+    TargetAccountAgeDays, CorrelationId, SourceTables
+| sort by RiskScore desc, TimeGenerated desc

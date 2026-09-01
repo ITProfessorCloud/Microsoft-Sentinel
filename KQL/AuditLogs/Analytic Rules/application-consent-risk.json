@@ -1,0 +1,115 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/application-consent-risk')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/application-consent-risk')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "Application Consent Risk",
+                "description": "Alerts on application consents that grant sensitive data access and carry a reason for suspicion: the consent rode a sign-in session Entra scored risky, the consenter holds a privileged role, the grant is tenant-wide, several people consented to the same app in one window, or the app was registered by an in-tenant user (the insider pattern). Consents to low-risk scopes never reach scoring, so the everyday openid-profile majority produces nothing. Every row carries the consenter's roles and department, the session's country and risk, the app's creator and age, and the granted scopes, so triage happens from the incident.\n\nTABLES: AuditLogs, SigninLogs, IdentityInfo\nCONNECTORS: Microsoft Entra ID (AuditLogs, SignInLogs); Microsoft Sentinel UEBA (IdentityInfo)\nLICENSE: Microsoft Sentinel; Microsoft Entra ID P1; P2 recommended (sign-in risk, UEBA). Without P2 the RiskyConsentSession and PrivilegedConsenter signals stay silent; the rest reads from AuditLogs.\n\nTUNING:\n1. Query period must be P14D - the 14d lookups only resolve if the rule looks back that far.\n2. RiskyScopes - the permissions that make a consent worth scoring at all.\n3. SensitiveRoles - the roles that make a consenter privileged.\n4. WaveThreshold - distinct consenters to one app in the window that count as a wave.\n5. SignInLookback - how far behind the consent to look for session risk.\n6. BusinessStart / BusinessEnd - local working hours; TimeGenerated is UTC.\n7. Widen DetectionWindow past the run frequency if slow waves split across runs.\n\nKNOWN FALSE POSITIVES:\n1. An admin doing planned tenant-wide consent of a mail or file integrated app fires once; that grant hands the app every mailbox, so one look is the correct price.\n2. A developer registering and testing their own app with sensitive scopes fires; confirm the app and close.\n3. A single unprivileged user consenting to a risky-scope app from a clean session stays silent by design; see blind spots.\n\nINVESTIGATION STEPS:\n1. Read RiskIndicators and GrantedScopes; mail, file and directory scopes are the illicit-consent shape.\n2. Check the consenter context in the row: ConsenterRoles, Department, UserType, Country, HighRiskSignIns.\n3. Check the app: SpCreator and SpCreatedTime in the row, then publisher verification and reply URLs in Entra.\n4. If ConsentWave fired, pull every consenter to the AppId and treat it as one campaign.\n5. If SelfRegisteredApp fired, interview the creator; a user-registered app with data scopes is either a project or an exfil tool.\n6. If malicious: revoke the OAuth2 grants and app role assignments, disable the service principal, revoke consenter sessions.\n\nBLIND SPOTS:\nA single unprivileged victim consenting from a clean session is indistinguishable from SaaS adoption without app reputation, which is not in the audit data; hunt below the threshold weekly and fix the posture with consent policies. Permissions granted straight through Graph (Add delegated permission grant, Add app role assignment) never raise this operation and need a companion rule. Publisher verification is not in the audit data. Scope parsing depends on the modifiedProperties text shape.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 2.0 | 2026-07-03",
+                "severity": "Medium",
+                "enabled": true,
+                "query": "// =====================================================================\n// Application Consent Risk - Entra ID\n// =====================================================================\n// Tables : AuditLogs, SigninLogs, IdentityInfo\n// License : Microsoft Sentinel; Entra ID P1; P2 recommended (sign-in risk, UEBA)\n// Tuning : see rule description for full tuning notes\n// Author : Bartosz Wysocki | itprofessor.cloud\n// Version : 2.0 | 2026-07-03\n// =====================================================================\nlet DetectionWindow = 1h;\nlet ConsentHistoryLookback = 14d; // prior consent per app, for the NewToTenant context flag\nlet SpCreationLookback = 14d; // service principal creations, for app age and creator\nlet IdentityLookback = 14d; // full UEBA sync cycle, for consenter roles and department\nlet SignInLookback = 1d; // how far behind the consent to look for session risk\nlet WaveThreshold = 3; // distinct consenters to one app in the window\nlet BusinessStart = 7;\nlet BusinessEnd = 19;\nlet FireThreshold = 3;\n// Scoring weights - any single strong reason fires; context signals only stack\nlet W_RiskySession = 3; // the consent rode a sign-in session Entra scored medium or high\nlet W_PrivConsenter = 3; // the consenter holds a sensitive directory role\nlet W_TenantWide = 3; // admin consent or an AllPrincipals grant of the risky scopes\nlet W_Wave = 3; // several distinct people consented to the same app in the window\nlet W_SelfRegistered = 2; // the service principal was registered by an in-tenant user\nlet W_NewToTenant = 1; // first consent to the app, or its service principal is recent; context only\nlet W_OffHours = 1; // activity outside working hours\nlet RiskyScopes = dynamic([\n\"Mail.Read\", \"Mail.ReadWrite\", \"Mail.Send\", \"MailboxSettings.ReadWrite\",\n\"Files.Read.All\", \"Files.ReadWrite.All\", \"Sites.Read.All\", \"Sites.ReadWrite.All\",\n\"Contacts.Read\", \"Notes.Read.All\", \"User.Read.All\", \"Directory.Read.All\",\n\"Directory.AccessAsUser.All\", \"EWS.AccessAsUser.All\", \"full_access_as_app\"\n]);\nlet SensitiveRoles = dynamic([\n\"Global Administrator\", \"Privileged Role Administrator\", \"Privileged Authentication Administrator\",\n\"Security Administrator\", \"User Administrator\", \"Application Administrator\",\n\"Cloud Application Administrator\", \"Hybrid Identity Administrator\",\n\"Exchange Administrator\", \"SharePoint Administrator\", \"Intune Administrator\"\n]);\n// Consent events in the window that grant sensitive scopes; the low-risk majority stops here.\n// Referenced twice below, so materialised once.\nlet ConsentEvents = materialize(\n AuditLogs\n | where TimeGenerated > ago(DetectionWindow)\n | where OperationName =~ \"Consent to application\"\n | where Result =~ \"success\"\n | extend InitiatorUPN = tolower(tostring(InitiatedBy.user.userPrincipalName))\n | extend InitiatorApp = tostring(InitiatedBy.app.displayName)\n | extend Initiator = iff(isnotempty(InitiatorUPN), InitiatorUPN, InitiatorApp)\n | extend InitiatorType = iff(isnotempty(InitiatorUPN), \"User\", \"App\")\n | extend IpAddress = iff(isnotempty(tostring(InitiatedBy.user.ipAddress)), tostring(InitiatedBy.user.ipAddress), tostring(InitiatedBy.app.ipAddress))\n | where isnotempty(Initiator)\n | mv-apply tr = TargetResources on (\n where tostring(tr.type) =~ \"ServicePrincipal\"\n | project AppName = tostring(tr.displayName), AppId = tostring(tr.id), PermBlob = tostring(tr.modifiedProperties)\n )\n | where isnotempty(AppId)\n | where PermBlob has_any (RiskyScopes)\n // User-Agent pulled with a null-safe extract; an mv-apply on the key drops consents that lack one\n | extend UserAgent = extract(@'\"key\":\"User-Agent\",\"value\":\"([^\"]*)\"', 1, tostring(AdditionalDetails))\n | extend AdminConsentVal = extract(@'IsAdminConsent[^}]*newValue\"?:\"?\\\\?\"?(True|False)', 1, PermBlob)\n | extend TenantWideEvent = AdminConsentVal =~ \"True\" or PermBlob has \"AllPrincipals\"\n | extend GrantedScopes = trim(\" \", extract(@\"Scope:\\s*([^,\\]]+)\", 1, PermBlob))\n | extend HourOfDay = datetime_part(\"Hour\", TimeGenerated)\n | extend OffHoursEvent = HourOfDay < BusinessStart or HourOfDay >= BusinessEnd or dayofweek(TimeGenerated) in (0d, 6d)\n);\n// Apps the tenant has consented to before, excluding the current window so events cannot self-baseline\nlet PriorConsentApps = AuditLogs\n | where TimeGenerated between (ago(ConsentHistoryLookback) .. ago(DetectionWindow))\n | where OperationName =~ \"Consent to application\"\n | where Result =~ \"success\"\n | mv-apply tr = TargetResources on (\n where tostring(tr.type) =~ \"ServicePrincipal\"\n | project PriorAppId = tostring(tr.id)\n )\n | where isnotempty(PriorAppId)\n | distinct PriorAppId;\n// Service principal creations: age plus creator. A user as the initiator means an in-tenant\n// registration; the consent flow instantiating a foreign app is service-initiated instead.\nlet NewServicePrincipals = AuditLogs\n | where TimeGenerated > ago(SpCreationLookback)\n | where OperationName =~ \"Add service principal\"\n | where Result =~ \"success\"\n | extend SpCreator0 = tolower(tostring(InitiatedBy.user.userPrincipalName))\n | mv-apply tr = TargetResources on (\n where tostring(tr.type) =~ \"ServicePrincipal\"\n | project SpId = tostring(tr.id)\n )\n | where isnotempty(SpId)\n | summarize SpCreatedTime = min(TimeGenerated), SpCreator = take_any(SpCreator0) by SpId;\n// Consenter identity: roles, department, type\nlet IdentityContext = IdentityInfo\n | where TimeGenerated > ago(IdentityLookback)\n | summarize arg_max(TimeGenerated, AssignedRoles, Department, JobTitle, UserType) by AccountUPN = tolower(AccountUPN);\n// Sign-in risk and location for the consenting user and IP\nlet SignInContext = SigninLogs\n | where TimeGenerated > ago(SignInLookback)\n | project SignInUPN = tolower(UserPrincipalName), IPAddress,\n RiskLevel = tostring(RiskLevelDuringSignIn),\n Country = tostring(LocationDetails.countryOrRegion)\n | summarize HighRiskSignIns = countif(RiskLevel in (\"high\", \"medium\")), Country = take_any(Country)\n by SignInUPN, IPAddress;\n// Distinct consenters per app in the window, for the wave signal\nlet WindowAppCounts = ConsentEvents\n | summarize WaveCount = dcount(Initiator) by AppId;\n// One row per consenter and app, scored\nConsentEvents\n| summarize\n StartTime = min(TimeGenerated),\n EndTime = max(TimeGenerated),\n ConsentCount = count(),\n TenantWideCnt = countif(TenantWideEvent),\n OffHoursCount = countif(OffHoursEvent),\n UserAgent = take_any(UserAgent),\n GrantedScopes = take_any(GrantedScopes)\n by Initiator, InitiatorType, AppName, AppId, IpAddress\n| join kind=leftouter WindowAppCounts on AppId\n| join kind=leftouter (PriorConsentApps) on $left.AppId == $right.PriorAppId\n| join kind=leftouter NewServicePrincipals on $left.AppId == $right.SpId\n| join kind=leftouter IdentityContext on $left.Initiator == $right.AccountUPN\n| join kind=leftouter SignInContext on $left.Initiator == $right.SignInUPN, $left.IpAddress == $right.IPAddress\n| extend TenantWide = TenantWideCnt > 0\n| extend NewToTenant = isempty(PriorAppId) or isnotempty(SpCreatedTime)\n| extend SelfRegistered = isnotempty(SpCreator)\n| extend ConsenterRoles = tostring(AssignedRoles)\n| extend sRiskySession = HighRiskSignIns > 0\n| extend sPrivConsenter = ConsenterRoles has_any (SensitiveRoles)\n| extend sTenantWide = TenantWide\n| extend sWave = WaveCount >= WaveThreshold\n| extend sSelfRegistered = SelfRegistered\n| extend sNewToTenant = NewToTenant\n| extend sOffHours = OffHoursCount > 0\n| extend RiskScore =\n iff(sRiskySession, W_RiskySession, 0)\n + iff(sPrivConsenter, W_PrivConsenter, 0)\n + iff(sTenantWide, W_TenantWide, 0)\n + iff(sWave, W_Wave, 0)\n + iff(sSelfRegistered, W_SelfRegistered, 0)\n + iff(sNewToTenant, W_NewToTenant, 0)\n + iff(sOffHours, W_OffHours, 0)\n| where RiskScore >= FireThreshold\n| extend Name = tostring(split(Initiator, \"@\", 0)[0]), UPNSuffix = tostring(split(Initiator, \"@\", 1)[0])\n| extend Risk_1 = iff(sRiskySession, \"RiskyConsentSession\", \"\")\n| extend Risk_2 = iff(sPrivConsenter, \"PrivilegedConsenter\", \"\")\n| extend Risk_3 = iff(sTenantWide, \"TenantWideGrant\", \"\")\n| extend Risk_4 = iff(sWave, \"ConsentWave\", \"\")\n| extend Risk_5 = iff(sSelfRegistered, \"SelfRegisteredApp\", \"\")\n| extend Risk_6 = iff(sNewToTenant, \"NewToTenant\", \"\")\n| extend Risk_7 = iff(sOffHours, \"OffHoursActivity\", \"\")\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n iff(isnotempty(Risk_1), strcat(Risk_1, \" | \"), \"\"),\n iff(isnotempty(Risk_2), strcat(Risk_2, \" | \"), \"\"),\n iff(isnotempty(Risk_3), strcat(Risk_3, \" | \"), \"\"),\n iff(isnotempty(Risk_4), strcat(Risk_4, \" | \"), \"\"),\n iff(isnotempty(Risk_5), strcat(Risk_5, \" | \"), \"\"),\n iff(isnotempty(Risk_6), strcat(Risk_6, \" | \"), \"\"),\n iff(isnotempty(Risk_7), strcat(Risk_7, \" | \"), \"\")\n))\n| project\n StartTime, EndTime, RiskScore, RiskIndicators,\n Initiator, Name, UPNSuffix, InitiatorType, IpAddress, Country, UserAgent,\n AppName, AppId, GrantedScopes, ConsentCount,\n TenantWide, NewToTenant, WaveCount, SpCreator, SpCreatedTime,\n ConsenterRoles, Department, JobTitle, UserType,\n HighRiskSignIns, OffHoursCount\n| sort by RiskScore desc, EndTime desc\n",
+                "queryFrequency": "PT1H",
+                "queryPeriod": "P14D",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": [
+                    "CredentialAccess",
+                    "Persistence"
+                ],
+                "techniques": [
+                    "T1528"
+                ],
+                "subTechniques": [],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT8H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": [
+                            "CloudApplication"
+                        ],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": null
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "AlertPerResult"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "Application consent risk: {{AppName}}",
+                    "alertDescriptionFormat": "{{Initiator}} consented to {{AppName}}. Risk indicators: {{RiskIndicators}}"
+                },
+                "customDetails": {
+                    "RiskScore": "RiskScore",
+                    "RiskIndicators": "RiskIndicators",
+                    "AppName": "AppName",
+                    "AppId": "AppId",
+                    "GrantedScopes": "GrantedScopes",
+                    "ConsenterRoles": "ConsenterRoles",
+                    "Department": "Department",
+                    "UserType": "UserType",
+                    "Country": "Country",
+                    "HighRiskSignIns": "HighRiskSignIns",
+                    "TenantWide": "TenantWide",
+                    "NewToTenant": "NewToTenant",
+                    "WaveCount": "WaveCount",
+                    "SpCreator": "SpCreator",
+                    "UserAgent": "UserAgent",
+                    "InitiatorType": "InitiatorType"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "Name"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "UPNSuffix"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "IpAddress"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "CloudApplication",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "AppName"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}

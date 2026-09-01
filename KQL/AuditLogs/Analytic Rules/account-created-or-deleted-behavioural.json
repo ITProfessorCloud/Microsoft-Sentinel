@@ -1,0 +1,106 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/account-created-or-deleted-behavioural')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/account-created-or-deleted-behavioural')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "Account Created or Deleted - Behavioural Detection - Entra ID",
+                "description": "Replaces the static non-approved-initiator list with behavioural detection of account lifecycle abuse. Surfaces a new account granted a sensitive role (backdoor persistence), bulk creation (persistence at scale), bulk deletion or deletion of a privileged account (destruction), and create/delete churn (burner access). Routine bulk provisioning is suppressed by an allowlist of known sync identities, applied only to the volume signals so a privileged follow-on still fires from any initiator, including an approved one.\n\nTABLES: AuditLogs, IdentityInfo\nCONNECTORS: Microsoft Entra ID (AuditLogs), Microsoft Sentinel UEBA (IdentityInfo)\nLICENSE: Microsoft Sentinel; Microsoft Entra ID P1 (audit logs), P2 recommended (UEBA / IdentityInfo for role context on deletions)\n\nTUNING:\n1. ApprovedProvisioners - your sync, SCIM and HR identities that legitimately bulk create or delete.\n2. Set the rule query period to P14D; the 14d lookups only resolve if the rule looks back that far.\n3. BulkCreateThreshold / BulkDeleteThreshold - align to your real onboarding and offboarding numbers.\n4. BusinessStart / BusinessEnd - local working hours; TimeGenerated is UTC, shift to your tenant.\n5. SensitiveRoles - the roles whose grant to a new account, or deletion, you treat as high impact.\n\nKNOWN FALSE POSITIVES:\n1. Nightly directory sync provisioning new starters - the initiator is a known provisioner, suppressed.\n2. Manual end of month deprovisioning by help desk - add those operators to ApprovedProvisioners or raise the delete threshold.\n3. Governed onboarding that assigns an admin role via an access package - validate and exclude the governance principal if legitimate.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 1.0 | 2026-06-30",
+                "severity": "Medium",
+                "enabled": true,
+                "query": "// =====================================================================\n// Account Created or Deleted - Behavioural Detection - Entra ID\n// =====================================================================\n// Description : Replaces the static non-approved-initiator list with behavioural detection of\n//               account lifecycle abuse. Surfaces a new account granted a sensitive role\n//               (backdoor persistence), bulk creation (persistence at scale), bulk deletion or\n//               deletion of a privileged account (destruction), and create/delete churn (burner\n//               access). Routine bulk provisioning is suppressed by an allowlist of known sync\n//               identities, applied only to the volume signals so a privileged follow-on still\n//               fires from any initiator, including an approved one.\n// Type        : Detection\n//\n// Tables      : AuditLogs, IdentityInfo\n// Connectors  : Microsoft Entra ID (AuditLogs), Microsoft Sentinel UEBA (IdentityInfo)\n// License     : Microsoft Sentinel; Microsoft Entra ID P1 (audit logs),\n//               P2 recommended (UEBA / IdentityInfo for role context on deletions)\n//\n// Tuning      : - ApprovedProvisioners - your sync, SCIM and HR identities that legitimately bulk create or delete\n//               - Set the rule query period to P14D; the 14d lookups only resolve if the rule itself looks back that far\n//               - BulkCreateThreshold / BulkDeleteThreshold - align to your real onboarding and offboarding numbers\n//               - BusinessStart / BusinessEnd - local working hours; TimeGenerated is UTC, shift to your tenant\n//               - SensitiveRoles - the roles whose grant to a new account, or deletion, you treat as high impact\n//               - For slow bursts that split across runs, widen DetectionWindow past the run frequency\n//               - To close the PIM path, add \"Add eligible member to role\" handling to the follow-on lookup\n//\n// Known FPs   : - Nightly directory sync provisioning new starters - the initiator is a known provisioner, suppressed\n//               - Manual end of month deprovisioning by help desk - add those operators to ApprovedProvisioners or raise the delete threshold\n//               - Governed onboarding that assigns an admin role via an access package - validate and exclude the governance principal if legitimate\n//\n// Author      : Bartosz Wysocki | https://www.itprofessor.cloud\n// Version     : 1.0 | 2026-06-30\n// =====================================================================\nlet DetectionWindow = 1h;\nlet RoleFollowWindow = 1h;        // a new account gaining a sensitive role inside this window reads as backdoor follow-on\nlet IdentityLookback = 14d;       // IdentityInfo for last known roles on a deleted account\nlet HistoryLookback = 14d;        // creation history, used to flag an initiator whose own account is recent\nlet BulkCreateThreshold = 5;      // distinct accounts created by one non-provisioner initiator\nlet BulkDeleteThreshold = 5;      // distinct accounts deleted by one non-provisioner initiator\nlet BusinessStart = 7;\nlet BusinessEnd = 19;\nlet FireThreshold = 4;\n// Scoring weights - the privileged follow-on and the destructive outcomes carry the most\nlet W_PrivCreated = 6;            // sensitive role landed on a newly created account\nlet W_BulkDelete = 5;            // bulk deletion by a non-provisioner\nlet W_PrivDeleted = 5;            // a deleted account held a sensitive role\nlet W_BulkCreate = 4;            // bulk creation by a non-provisioner\nlet W_Churn = 3;            // same initiator created and deleted in the window\nlet W_InitiatorNew = 2;            // initiator account is itself recent\nlet W_OffHours = 1;            // activity outside working hours\nlet SensitiveRoles = dynamic([\n\"Global Administrator\",\n\"Privileged Role Administrator\",\n\"Privileged Authentication Administrator\",\n\"Security Administrator\",\n\"User Administrator\",\n\"Application Administrator\",\n\"Cloud Application Administrator\",\n\"Hybrid Identity Administrator\",\n\"Exchange Administrator\",\n\"SharePoint Administrator\",\n\"Intune Administrator\"\n]);\nlet ApprovedProvisioners = dynamic([\n// \"Microsoft Entra Connect Sync Service Account\",\n// \"Okta Provisioning Agent\",\n// \"Workday Inbound Provisioning\"\n]);\n// Sensitive roles granted to a principal inside the follow-on window, one row per principal object id\nlet SensitiveRoleGrants = AuditLogs\n    | where TimeGenerated > ago(RoleFollowWindow)\n    | where OperationName =~ \"Add member to role\"\n    | where Result =~ \"success\"\n    | mv-expand TargetResources\n    | where tostring(TargetResources.type) =~ \"User\"\n    | extend GrantedId = tostring(TargetResources.id)\n    | mv-apply mp = TargetResources.modifiedProperties on (\n        where tostring(mp.displayName) =~ \"Role.DisplayName\"\n        | project RoleName = trim('\"', tostring(mp.newValue))\n      )\n    | where RoleName in~ (SensitiveRoles)\n    | summarize SensitiveRolesGranted = make_set(RoleName) by GrantedId;\n// Last known identity context, keyed on object id so a deleted account still resolves\nlet IdentityContext = IdentityInfo\n    | where TimeGenerated > ago(IdentityLookback)\n    | summarize arg_max(TimeGenerated, AssignedRoles, UserType) by AccountObjectId = tostring(AccountObjectId);\n// Accounts created in the wider history, used to tell whether an initiator is itself recent\nlet CreatedHistory = AuditLogs\n    | where TimeGenerated > ago(HistoryLookback)\n    | where OperationName =~ \"Add user\"\n    | where Result =~ \"success\"\n    | mv-apply tr = TargetResources on (\n        where tostring(tr.type) =~ \"User\"\n        | project CreatedUPN = tolower(tostring(tr.userPrincipalName))\n      )\n    | where isnotempty(CreatedUPN)\n    | summarize InitiatorCreatedTime = min(TimeGenerated) by CreatedUPN;\n// Successful create and delete events in the detection window\nlet AccountEvents = AuditLogs\n    | where TimeGenerated > ago(DetectionWindow)\n    | where OperationName in~ (\"Add user\", \"Delete user\")\n    | where Result =~ \"success\"\n    | extend Operation = iff(OperationName =~ \"Add user\", \"Create\", \"Delete\")\n    | extend InitiatorUPN = tolower(tostring(InitiatedBy.user.userPrincipalName))\n    | extend InitiatorApp = tostring(InitiatedBy.app.displayName)\n    | extend Initiator = iff(isnotempty(InitiatorUPN), InitiatorUPN, InitiatorApp)\n    | extend InitiatorType = iff(isnotempty(InitiatorUPN), \"User\", \"App\")\n    | extend InitiatorIp = iff(isnotempty(tostring(InitiatedBy.user.ipAddress)), tostring(InitiatedBy.user.ipAddress), tostring(InitiatedBy.app.ipAddress))\n    | where isnotempty(Initiator)\n    | mv-apply tr = TargetResources on (\n        where tostring(tr.type) =~ \"User\"\n        | project TargetUPN = tolower(tostring(tr.userPrincipalName)),\n                  TargetId = tostring(tr.id),\n                  TargetName = tostring(tr.displayName)\n      )\n    | extend HourOfDay = datetime_part(\"Hour\", TimeGenerated)\n    | extend OffHoursEvent = HourOfDay < BusinessStart or HourOfDay >= BusinessEnd or dayofweek(TimeGenerated) in (0d, 6d);\n// Tag each event with privilege context, then score per initiator\nAccountEvents\n| join kind=leftouter SensitiveRoleGrants on $left.TargetId == $right.GrantedId\n| join kind=leftouter IdentityContext on $left.TargetId == $right.AccountObjectId\n| extend PrivCreatedEvent = Operation == \"Create\" and isnotempty(SensitiveRolesGranted)\n| extend PrivDeletedEvent = Operation == \"Delete\" and tostring(AssignedRoles) has_any (SensitiveRoles)\n| extend CreatedPrivRole = iff(PrivCreatedEvent, strcat_array(SensitiveRolesGranted, \" / \"), \"\")\n| summarize\n    StartTime = min(TimeGenerated),\n    EndTime = max(TimeGenerated),\n    CreatedCount = dcountif(TargetId, Operation == \"Create\"),\n    DeletedCount = dcountif(TargetId, Operation == \"Delete\"),\n    PrivCreatedCount = dcountif(TargetId, PrivCreatedEvent),\n    PrivDeletedCount = dcountif(TargetId, PrivDeletedEvent),\n    CreatedTargets = make_set_if(TargetUPN, Operation == \"Create\", 15),\n    DeletedTargets = make_set_if(TargetUPN, Operation == \"Delete\", 15),\n    PrivRolesGranted = make_set_if(CreatedPrivRole, PrivCreatedEvent, 10),\n    PrivAcctsDeleted = make_set_if(TargetUPN, PrivDeletedEvent, 10),\n    OffHoursCount = countif(OffHoursEvent),\n    IpSet = make_set(InitiatorIp, 10),\n    PrimaryIp = take_any(InitiatorIp)\n  by Initiator, InitiatorType, InitiatorApp\n| join kind=leftouter CreatedHistory on $left.Initiator == $right.CreatedUPN\n| extend InitiatorIsNew = isnotempty(InitiatorCreatedTime)\n| extend IsApprovedProvisioner = Initiator in~ (ApprovedProvisioners) or InitiatorApp in~ (ApprovedProvisioners)\n| extend sPrivCreated = PrivCreatedCount > 0\n| extend sPrivDeleted = PrivDeletedCount > 0\n| extend sBulkCreate = CreatedCount >= BulkCreateThreshold and not(IsApprovedProvisioner)\n| extend sBulkDelete = DeletedCount >= BulkDeleteThreshold and not(IsApprovedProvisioner)\n| extend sChurn = CreatedCount > 0 and DeletedCount > 0 and not(IsApprovedProvisioner)\n| extend sInitiatorNew = InitiatorIsNew\n| extend sOffHours = OffHoursCount > 0\n| extend RiskScore =\n      iff(sPrivCreated, W_PrivCreated, 0)\n    + iff(sBulkDelete, W_BulkDelete, 0)\n    + iff(sPrivDeleted, W_PrivDeleted, 0)\n    + iff(sBulkCreate, W_BulkCreate, 0)\n    + iff(sChurn, W_Churn, 0)\n    + iff(sInitiatorNew, W_InitiatorNew, 0)\n    + iff(sOffHours, W_OffHours, 0)\n| where RiskScore >= FireThreshold\n| extend Name = tostring(split(Initiator, \"@\", 0)[0]), UPNSuffix = tostring(split(Initiator, \"@\", 1)[0])\n| extend Risk_1 = iff(sPrivCreated, \"PrivRoleOnNewAccount\", \"\")\n| extend Risk_2 = iff(sBulkDelete, \"BulkDeletion\", \"\")\n| extend Risk_3 = iff(sPrivDeleted, \"PrivilegedAcctDeleted\", \"\")\n| extend Risk_4 = iff(sBulkCreate, \"BulkCreation\", \"\")\n| extend Risk_5 = iff(sChurn, \"CreateDeleteChurn\", \"\")\n| extend Risk_6 = iff(sInitiatorNew, \"InitiatorIsRecent\", \"\")\n| extend Risk_7 = iff(sOffHours, \"OffHoursActivity\", \"\")\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n    iff(isnotempty(Risk_1), strcat(Risk_1, \" | \"), \"\"),\n    iff(isnotempty(Risk_2), strcat(Risk_2, \" | \"), \"\"),\n    iff(isnotempty(Risk_3), strcat(Risk_3, \" | \"), \"\"),\n    iff(isnotempty(Risk_4), strcat(Risk_4, \" | \"), \"\"),\n    iff(isnotempty(Risk_5), strcat(Risk_5, \" | \"), \"\"),\n    iff(isnotempty(Risk_6), strcat(Risk_6, \" | \"), \"\"),\n    iff(isnotempty(Risk_7), strcat(Risk_7, \" | \"), \"\")\n))\n| project\n    StartTime, EndTime, RiskScore, RiskIndicators,\n    Initiator, Name, UPNSuffix, InitiatorType, PrimaryIp, IpSet,\n    CreatedCount, DeletedCount, PrivCreatedCount, PrivDeletedCount,\n    CreatedTargets, DeletedTargets, PrivRolesGranted, PrivAcctsDeleted,\n    InitiatorIsNew, OffHoursCount, IsApprovedProvisioner\n| sort by RiskScore desc, EndTime desc",
+                "queryFrequency": "PT1H",
+                "queryPeriod": "P14D",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": [
+                    "Persistence",
+                    "PrivilegeEscalation",
+                    "Impact"
+                ],
+                "techniques": [
+                    "T1136",
+                    "T1098",
+                    "T1531"
+                ],
+                "subTechniques": [
+                    "T1136.003",
+                    "T1098.003"
+                ],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT8H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": [
+                            "Account"
+                        ],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": null
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "AlertPerResult"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "Account lifecycle abuse by {{Initiator}} (score {{RiskScore}})",
+                    "alertDescriptionFormat": "Account lifecycle abuse by {{Initiator}}. Indicators: {{RiskIndicators}}. Score {{RiskScore}}."
+                },
+                "customDetails": {
+                    "RiskScore": "RiskScore",
+                    "RiskIndicators": "RiskIndicators",
+                    "CreatedCount": "CreatedCount",
+                    "DeletedCount": "DeletedCount",
+                    "PrivCreatedCount": "PrivCreatedCount",
+                    "PrivDeletedCount": "PrivDeletedCount",
+                    "PrivRolesGranted": "PrivRolesGranted",
+                    "InitiatorType": "InitiatorType",
+                    "OffHoursCount": "OffHoursCount",
+                    "ApprovedProvisioner": "IsApprovedProvisioner"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "Name"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "UPNSuffix"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "PrimaryIp"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}

@@ -1,0 +1,119 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "String"
+        }
+    },
+    "resources": [
+        {
+            "id": "[concat(resourceId('Microsoft.OperationalInsights/workspaces/providers', parameters('workspace'), 'Microsoft.SecurityInsights'),'/alertRules/account-created-and-deleted-short-timeframe')]",
+            "name": "[concat(parameters('workspace'),'/Microsoft.SecurityInsights/account-created-and-deleted-short-timeframe')]",
+            "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+            "kind": "Scheduled",
+            "apiVersion": "2023-12-01-preview",
+            "properties": {
+                "displayName": "Account Created and Deleted in Short Timeframe - Entra ID",
+                "description": "Pairs a user-account deletion with its earlier creation and surfaces the pair only when the short-lived account was actually used during its life: it signed in, or it was granted a directory role. A create/delete pair with no in-life activity is intended as lifecycle churn. Shortness of life and a single human actor running the whole create-then-delete lifecycle add weight through additive scoring.\n\nTABLES: AuditLogs, SigninLogs, AADNonInteractiveUserSignInLogs\nCONNECTORS: Microsoft Entra ID (AuditLogs, SignInLogs, NonInteractiveUserSignInLogs)\nLICENSE: Microsoft Sentinel\n\nTUNING:\n1. DetectionWindow - recent deletions that trigger evaluation; align to run frequency.\n2. LookbackWindow - how far back to find the matching creation and any in-life activity.\n3. VeryShortLife / ShortLife - the two lifetime tiers that feed LifeWeight.\n4. PrivilegedRoleOps - directory-role operations that count as escalation; extend for privileged groups, app consent or credential adds if those paths matter.\n5. W_* weights and ScoreThreshold - shift to fit your environment.\n\nKNOWN FALSE POSITIVES:\n1. Provisioning or HR-sync rollbacks - created and deleted with no activity.\n2. B2B guest invited and removed without signing in - no activity.\n3. Admin error: account created, used briefly, removed same day - low volume, expected.\n\nINVESTIGATION STEPS:\n1. Confirm the pair is one identity: same UserId across CreationTime and DeletionTime.\n2. Read RiskIndicators to see which signals fired (activity, tier, same actor).\n3. If RoleGrantedDuringLife, inspect RoleOps and treat as escalation until cleared.\n4. If SignedInDuringLife, review SignInIPs and SignInCount for the source and volume.\n5. Compare CreatedByUser and DeletedByUser; a single human running both is higher concern.\n6. Correlate CreatedByIP / DeletedByIP with known admin infrastructure.\n\nBLIND SPOTS: Only catches accounts deleted within DetectionWindow whose creation and activity fall inside LookbackWindow; a delete outside the run window or an older-than-Lookback creation is missed. Non-role privilege paths (group membership, app consent, credential adds) are not scored. Activity via other data sources than sign-in or role grant is not evaluated.\n\nAuthor: Bartosz Wysocki | https://www.itprofessor.cloud\nVersion: 1.0 | 2026-06-17",
+                "severity": "Medium",
+                "enabled": true,
+                "query": "// =====================================================================\n// Account Created and Deleted in Short Timeframe - Entra ID\n// =====================================================================\n// Tables : AuditLogs, SigninLogs, AADNonInteractiveUserSignInLogs\n// License : Microsoft Sentinel\n// Tuning : see rule description for full tuning notes\n// Author : Bartosz Wysocki | itprofessor.cloud\n// Version : 1.0 | 2026-06-17\n// =====================================================================\nlet DetectionWindow = 1h; // recent deletions that trigger evaluation\nlet LookbackWindow = 7d; // window to find the matching creation and any in-life activity\nlet VeryShortLife = 1h;\nlet ShortLife = 24h;\nlet PrivilegedRoleOps = dynamic([\"Add member to role\", \"Add eligible member to role\"]);\n// Scoring weights - activity carries the most; shortness and a single human actor add to it\nlet W_VeryShortLife = 3;\nlet W_ShortLife = 2;\nlet W_SignedIn = 3;\nlet W_RoleGranted = 4;\nlet W_SameUserActor = 2;\nlet ScoreThreshold = 4;\n// User-account deletions in the recent window\nlet Deletions = AuditLogs\n | where TimeGenerated > ago(DetectionWindow)\n | where OperationName =~ \"Delete user\"\n | mv-apply tr = TargetResources on (\n where tostring(tr.type) =~ \"User\"\n | extend UserId = tostring(tr.id), TargetUPN = tolower(tostring(tr.userPrincipalName))\n )\n | extend DeletedByUser = tolower(tostring(InitiatedBy.user.userPrincipalName)),\n DeletedByApp = tostring(InitiatedBy.app.displayName),\n DeletedByIP = tostring(InitiatedBy.user.ipAddress)\n | project DeletionTime = TimeGenerated, UserId, TargetUPN, DeletedByUser, DeletedByApp, DeletedByIP;\n// User-account creations in the lookback\nlet Creations = AuditLogs\n | where TimeGenerated > ago(LookbackWindow)\n | where OperationName =~ \"Add user\"\n | mv-apply tr = TargetResources on (\n where tostring(tr.type) =~ \"User\"\n | extend UserId = tostring(tr.id)\n )\n | extend CreatedByUser = tolower(tostring(InitiatedBy.user.userPrincipalName)),\n CreatedByApp = tostring(InitiatedBy.app.displayName),\n CreatedByIP = tostring(InitiatedBy.user.ipAddress)\n | project CreationTime = TimeGenerated, UserId, CreatedByUser, CreatedByApp, CreatedByIP;\n// Create/delete pairs with a positive lifetime inside the window\nlet Pairs = materialize(\n Deletions\n | join kind=inner Creations on UserId\n | extend Lifetime = DeletionTime - CreationTime\n | where Lifetime between (time(0s) .. LookbackWindow));\n// Restrict the activity scans to just the short-lived accounts (keeps the query cheap)\nlet CandidateIds = toscalar(Pairs | summarize make_set(UserId, 1000));\n// Did the account sign in? It could only have done so during its life\nlet SignInActivity = union isfuzzy=true\n (SigninLogs | where TimeGenerated > ago(LookbackWindow) | where UserId in (CandidateIds) | project UserId, IPAddress),\n (AADNonInteractiveUserSignInLogs | where TimeGenerated > ago(LookbackWindow) | where UserId in (CandidateIds) | project UserId, IPAddress)\n | summarize SignInCount = count(), SignInIPs = make_set(IPAddress, 20) by UserId;\n// Was it granted a directory role during its life?\nlet RoleGrantActivity = AuditLogs\n | where TimeGenerated > ago(LookbackWindow)\n | where OperationName in~ (PrivilegedRoleOps)\n | mv-apply tr = TargetResources on (\n where tostring(tr.type) =~ \"User\"\n | extend UserId = tostring(tr.id)\n )\n | where UserId in (CandidateIds)\n | summarize RoleGrantCount = count(), RoleOps = make_set(OperationName, 5) by UserId;\nPairs\n| join kind=leftouter SignInActivity on UserId\n| join kind=leftouter RoleGrantActivity on UserId\n| extend SignedIn = coalesce(SignInCount, 0) > 0\n| extend RoleGranted = coalesce(RoleGrantCount, 0) > 0\n| extend SameUserActor = isnotempty(CreatedByUser) and CreatedByUser == DeletedByUser\n| extend LifeWeight = case(Lifetime < VeryShortLife, W_VeryShortLife, Lifetime < ShortLife, W_ShortLife, 0)\n| extend Score = LifeWeight\n + toint(SignedIn) * W_SignedIn\n + toint(RoleGranted) * W_RoleGranted\n + toint(SameUserActor) * W_SameUserActor\n| where Score >= ScoreThreshold\n| extend RiskIndicators = trim(@\"\\s\\|\\s*$\", strcat(\n iff(Lifetime < VeryShortLife, \"VeryShortLife | \", iff(Lifetime < ShortLife, \"ShortLife | \", \"\")),\n iff(SignedIn, \"SignedInDuringLife | \", \"\"),\n iff(RoleGranted, \"RoleGrantedDuringLife | \", \"\"),\n iff(SameUserActor, \"SameUserActor | \", \"\")\n))\n| extend TargetName = tostring(split(TargetUPN, \"@\", 0)[0]), TargetUPNSuffix = tostring(split(TargetUPN, \"@\", 1)[0])\n| extend CreatedByName = tostring(split(CreatedByUser, \"@\", 0)[0]), CreatedByUPNSuffix = tostring(split(CreatedByUser, \"@\", 1)[0])\n| project\n CreationTime, DeletionTime, Lifetime, Score, RiskIndicators,\n TargetUPN, TargetName, TargetUPNSuffix, UserId,\n SignInCount, SignInIPs, RoleOps,\n CreatedByUser, CreatedByName, CreatedByUPNSuffix, CreatedByApp, CreatedByIP,\n DeletedByUser, DeletedByApp, DeletedByIP\n| sort by Score desc, Lifetime asc",
+                "queryFrequency": "PT1H",
+                "queryPeriod": "P7D",
+                "triggerOperator": "GreaterThan",
+                "triggerThreshold": 0,
+                "suppressionDuration": "PT1H",
+                "suppressionEnabled": false,
+                "startTimeUtc": null,
+                "tactics": [
+                    "Persistence",
+                    "PrivilegeEscalation"
+                ],
+                "techniques": [
+                    "T1136",
+                    "T1098"
+                ],
+                "subTechniques": [
+                    "T1136.003",
+                    "T1098.003"
+                ],
+                "alertRuleTemplateName": null,
+                "incidentConfiguration": {
+                    "createIncident": true,
+                    "groupingConfiguration": {
+                        "enabled": true,
+                        "reopenClosedIncident": false,
+                        "lookbackDuration": "PT2H",
+                        "matchingMethod": "Selected",
+                        "groupByEntities": [
+                            "Account"
+                        ],
+                        "groupByAlertDetails": null,
+                        "groupByCustomDetails": null
+                    }
+                },
+                "eventGroupingSettings": {
+                    "aggregationKind": "SingleAlert"
+                },
+                "alertDetailsOverride": {
+                    "alertDisplayNameFormat": "Short-lived account used then deleted: {{TargetUPN}} (score {{Score}})",
+                    "alertDescriptionFormat": "Account {{TargetUPN}} lived {{Lifetime}} and showed activity before deletion. Indicators: {{RiskIndicators}}."
+                },
+                "customDetails": {
+                    "Score": "Score",
+                    "RiskIndicators": "RiskIndicators",
+                    "Lifetime": "Lifetime",
+                    "SignInCount": "SignInCount",
+                    "RoleOps": "RoleOps",
+                    "SignInIPs": "SignInIPs",
+                    "CreatedBy": "CreatedByUser",
+                    "DeletedBy": "DeletedByUser"
+                },
+                "entityMappings": [
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "TargetName"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "TargetUPNSuffix"
+                            },
+                            {
+                                "identifier": "AadUserId",
+                                "columnName": "UserId"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "Account",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Name",
+                                "columnName": "CreatedByName"
+                            },
+                            {
+                                "identifier": "UPNSuffix",
+                                "columnName": "CreatedByUPNSuffix"
+                            }
+                        ]
+                    },
+                    {
+                        "entityType": "IP",
+                        "fieldMappings": [
+                            {
+                                "identifier": "Address",
+                                "columnName": "DeletedByIP"
+                            }
+                        ]
+                    }
+                ],
+                "sentinelEntitiesMappings": null,
+                "templateVersion": null
+            }
+        }
+    ]
+}

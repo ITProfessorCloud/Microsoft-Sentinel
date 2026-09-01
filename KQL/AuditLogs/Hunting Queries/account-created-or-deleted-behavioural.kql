@@ -1,0 +1,181 @@
+// =====================================================================
+// Account Created or Deleted - Behavioural Detection - Entra ID
+// =====================================================================
+// Description : Replaces the static non-approved-initiator list with behavioural detection of
+//               account lifecycle abuse. Surfaces a new account granted a sensitive role
+//               (backdoor persistence), bulk creation (persistence at scale), bulk deletion or
+//               deletion of a privileged account (destruction), and create/delete churn (burner
+//               access). Routine bulk provisioning is suppressed by an allowlist of known sync
+//               identities, applied only to the volume signals so a privileged follow-on still
+//               fires from any initiator, including an approved one.
+// Type        : Detection
+//
+// Tables      : AuditLogs, IdentityInfo
+// Connectors  : Microsoft Entra ID (AuditLogs), Microsoft Sentinel UEBA (IdentityInfo)
+// License     : Microsoft Sentinel; Microsoft Entra ID P1 (audit logs),
+//               P2 recommended (UEBA / IdentityInfo for role context on deletions)
+//
+// Tuning      : - ApprovedProvisioners - your sync, SCIM and HR identities that legitimately bulk create or delete
+//               - Set the rule query period to P14D; the 14d lookups only resolve if the rule itself looks back that far
+//               - BulkCreateThreshold / BulkDeleteThreshold - align to your real onboarding and offboarding numbers
+//               - BusinessStart / BusinessEnd - local working hours; TimeGenerated is UTC, shift to your tenant
+//               - SensitiveRoles - the roles whose grant to a new account, or deletion, you treat as high impact
+//               - For slow bursts that split across runs, widen DetectionWindow past the run frequency
+//               - To close the PIM path, add "Add eligible member to role" handling to the follow-on lookup
+//
+// Known FPs   : - Nightly directory sync provisioning new starters - the initiator is a known provisioner, suppressed
+//               - Manual end of month deprovisioning by help desk - add those operators to ApprovedProvisioners or raise the delete threshold
+//               - Governed onboarding that assigns an admin role via an access package - validate and exclude the governance principal if legitimate
+//
+// Author      : Bartosz Wysocki | https://www.itprofessor.cloud
+// Version     : 1.0 | 2026-06-30
+// =====================================================================
+let DetectionWindow = 1h;
+let RoleFollowWindow = 1h;        // a new account gaining a sensitive role inside this window reads as backdoor follow-on
+let IdentityLookback = 14d;       // IdentityInfo for last known roles on a deleted account
+let HistoryLookback = 14d;        // creation history, used to flag an initiator whose own account is recent
+let BulkCreateThreshold = 5;      // distinct accounts created by one non-provisioner initiator
+let BulkDeleteThreshold = 5;      // distinct accounts deleted by one non-provisioner initiator
+let BusinessStart = 7;
+let BusinessEnd = 19;
+let FireThreshold = 4;
+// Scoring weights - the privileged follow-on and the destructive outcomes carry the most
+let W_PrivCreated = 6;            // sensitive role landed on a newly created account
+let W_BulkDelete = 5;            // bulk deletion by a non-provisioner
+let W_PrivDeleted = 5;            // a deleted account held a sensitive role
+let W_BulkCreate = 4;            // bulk creation by a non-provisioner
+let W_Churn = 3;            // same initiator created and deleted in the window
+let W_InitiatorNew = 2;            // initiator account is itself recent
+let W_OffHours = 1;            // activity outside working hours
+let SensitiveRoles = dynamic([
+"Global Administrator",
+"Privileged Role Administrator",
+"Privileged Authentication Administrator",
+"Security Administrator",
+"User Administrator",
+"Application Administrator",
+"Cloud Application Administrator",
+"Hybrid Identity Administrator",
+"Exchange Administrator",
+"SharePoint Administrator",
+"Intune Administrator"
+]);
+let ApprovedProvisioners = dynamic([
+// "Microsoft Entra Connect Sync Service Account",
+// "Okta Provisioning Agent",
+// "Workday Inbound Provisioning"
+]);
+// Sensitive roles granted to a principal inside the follow-on window, one row per principal object id
+let SensitiveRoleGrants = AuditLogs
+    | where TimeGenerated > ago(RoleFollowWindow)
+    | where OperationName =~ "Add member to role"
+    | where Result =~ "success"
+    | mv-expand TargetResources
+    | where tostring(TargetResources.type) =~ "User"
+    | extend GrantedId = tostring(TargetResources.id)
+    | mv-apply mp = TargetResources.modifiedProperties on (
+        where tostring(mp.displayName) =~ "Role.DisplayName"
+        | project RoleName = trim('"', tostring(mp.newValue))
+      )
+    | where RoleName in~ (SensitiveRoles)
+    | summarize SensitiveRolesGranted = make_set(RoleName) by GrantedId;
+// Last known identity context, keyed on object id so a deleted account still resolves
+let IdentityContext = IdentityInfo
+    | where TimeGenerated > ago(IdentityLookback)
+    | summarize arg_max(TimeGenerated, AssignedRoles, UserType) by AccountObjectId = tostring(AccountObjectId);
+// Accounts created in the wider history, used to tell whether an initiator is itself recent
+let CreatedHistory = AuditLogs
+    | where TimeGenerated > ago(HistoryLookback)
+    | where OperationName =~ "Add user"
+    | where Result =~ "success"
+    | mv-apply tr = TargetResources on (
+        where tostring(tr.type) =~ "User"
+        | project CreatedUPN = tolower(tostring(tr.userPrincipalName))
+      )
+    | where isnotempty(CreatedUPN)
+    | summarize InitiatorCreatedTime = min(TimeGenerated) by CreatedUPN;
+// Successful create and delete events in the detection window
+let AccountEvents = AuditLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where OperationName in~ ("Add user", "Delete user")
+    | where Result =~ "success"
+    | extend Operation = iff(OperationName =~ "Add user", "Create", "Delete")
+    | extend InitiatorUPN = tolower(tostring(InitiatedBy.user.userPrincipalName))
+    | extend InitiatorApp = tostring(InitiatedBy.app.displayName)
+    | extend Initiator = iff(isnotempty(InitiatorUPN), InitiatorUPN, InitiatorApp)
+    | extend InitiatorType = iff(isnotempty(InitiatorUPN), "User", "App")
+    | extend InitiatorIp = iff(isnotempty(tostring(InitiatedBy.user.ipAddress)), tostring(InitiatedBy.user.ipAddress), tostring(InitiatedBy.app.ipAddress))
+    | where isnotempty(Initiator)
+    | mv-apply tr = TargetResources on (
+        where tostring(tr.type) =~ "User"
+        | project TargetUPN = tolower(tostring(tr.userPrincipalName)),
+                  TargetId = tostring(tr.id),
+                  TargetName = tostring(tr.displayName)
+      )
+    | extend HourOfDay = datetime_part("Hour", TimeGenerated)
+    | extend OffHoursEvent = HourOfDay < BusinessStart or HourOfDay >= BusinessEnd or dayofweek(TimeGenerated) in (0d, 6d);
+// Tag each event with privilege context, then score per initiator
+AccountEvents
+| join kind=leftouter SensitiveRoleGrants on $left.TargetId == $right.GrantedId
+| join kind=leftouter IdentityContext on $left.TargetId == $right.AccountObjectId
+| extend PrivCreatedEvent = Operation == "Create" and isnotempty(SensitiveRolesGranted)
+| extend PrivDeletedEvent = Operation == "Delete" and tostring(AssignedRoles) has_any (SensitiveRoles)
+| extend CreatedPrivRole = iff(PrivCreatedEvent, strcat_array(SensitiveRolesGranted, " / "), "")
+| summarize
+    StartTime = min(TimeGenerated),
+    EndTime = max(TimeGenerated),
+    CreatedCount = dcountif(TargetId, Operation == "Create"),
+    DeletedCount = dcountif(TargetId, Operation == "Delete"),
+    PrivCreatedCount = dcountif(TargetId, PrivCreatedEvent),
+    PrivDeletedCount = dcountif(TargetId, PrivDeletedEvent),
+    CreatedTargets = make_set_if(TargetUPN, Operation == "Create", 15),
+    DeletedTargets = make_set_if(TargetUPN, Operation == "Delete", 15),
+    PrivRolesGranted = make_set_if(CreatedPrivRole, PrivCreatedEvent, 10),
+    PrivAcctsDeleted = make_set_if(TargetUPN, PrivDeletedEvent, 10),
+    OffHoursCount = countif(OffHoursEvent),
+    IpSet = make_set(InitiatorIp, 10),
+    PrimaryIp = take_any(InitiatorIp)
+  by Initiator, InitiatorType, InitiatorApp
+| join kind=leftouter CreatedHistory on $left.Initiator == $right.CreatedUPN
+| extend InitiatorIsNew = isnotempty(InitiatorCreatedTime)
+| extend IsApprovedProvisioner = Initiator in~ (ApprovedProvisioners) or InitiatorApp in~ (ApprovedProvisioners)
+| extend sPrivCreated = PrivCreatedCount > 0
+| extend sPrivDeleted = PrivDeletedCount > 0
+| extend sBulkCreate = CreatedCount >= BulkCreateThreshold and not(IsApprovedProvisioner)
+| extend sBulkDelete = DeletedCount >= BulkDeleteThreshold and not(IsApprovedProvisioner)
+| extend sChurn = CreatedCount > 0 and DeletedCount > 0 and not(IsApprovedProvisioner)
+| extend sInitiatorNew = InitiatorIsNew
+| extend sOffHours = OffHoursCount > 0
+| extend RiskScore =
+      iff(sPrivCreated, W_PrivCreated, 0)
+    + iff(sBulkDelete, W_BulkDelete, 0)
+    + iff(sPrivDeleted, W_PrivDeleted, 0)
+    + iff(sBulkCreate, W_BulkCreate, 0)
+    + iff(sChurn, W_Churn, 0)
+    + iff(sInitiatorNew, W_InitiatorNew, 0)
+    + iff(sOffHours, W_OffHours, 0)
+| where RiskScore >= FireThreshold
+| extend Name = tostring(split(Initiator, "@", 0)[0]), UPNSuffix = tostring(split(Initiator, "@", 1)[0])
+| extend Risk_1 = iff(sPrivCreated, "PrivRoleOnNewAccount", "")
+| extend Risk_2 = iff(sBulkDelete, "BulkDeletion", "")
+| extend Risk_3 = iff(sPrivDeleted, "PrivilegedAcctDeleted", "")
+| extend Risk_4 = iff(sBulkCreate, "BulkCreation", "")
+| extend Risk_5 = iff(sChurn, "CreateDeleteChurn", "")
+| extend Risk_6 = iff(sInitiatorNew, "InitiatorIsRecent", "")
+| extend Risk_7 = iff(sOffHours, "OffHoursActivity", "")
+| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
+    iff(isnotempty(Risk_1), strcat(Risk_1, " | "), ""),
+    iff(isnotempty(Risk_2), strcat(Risk_2, " | "), ""),
+    iff(isnotempty(Risk_3), strcat(Risk_3, " | "), ""),
+    iff(isnotempty(Risk_4), strcat(Risk_4, " | "), ""),
+    iff(isnotempty(Risk_5), strcat(Risk_5, " | "), ""),
+    iff(isnotempty(Risk_6), strcat(Risk_6, " | "), ""),
+    iff(isnotempty(Risk_7), strcat(Risk_7, " | "), "")
+))
+| project
+    StartTime, EndTime, RiskScore, RiskIndicators,
+    Initiator, Name, UPNSuffix, InitiatorType, PrimaryIp, IpSet,
+    CreatedCount, DeletedCount, PrivCreatedCount, PrivDeletedCount,
+    CreatedTargets, DeletedTargets, PrivRolesGranted, PrivAcctsDeleted,
+    InitiatorIsNew, OffHoursCount, IsApprovedProvisioner
+| sort by RiskScore desc, EndTime desc
