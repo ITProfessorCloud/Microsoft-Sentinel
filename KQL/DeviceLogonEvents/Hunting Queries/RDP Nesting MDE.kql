@@ -1,41 +1,65 @@
 // =====================================================================
-// RDP Nesting - Defender for Endpoint (DeviceLogonEvents)
+// RDP Nesting - Defender for Endpoint (DeviceLogonEvents) - v3.0
 // =====================================================================
 // Description : Detects RDP nesting (lateral movement chains) by linking an inbound
 //               RemoteInteractive logon to a host with an onward RemoteInteractive logon
-//               from that host, by the same account, within a time window. Hops are linked
-//               by source hostname (RemoteDeviceName), so no IP resolution is needed.
-//               Established pivot paths are suppressed via a 14-day baseline.
+//               from that host, by the same account, within a time window.
+//               Hops are linked on the source address carried by the logon, resolved to a
+//               device. Defender does not populate RemoteDeviceName on RemoteInteractive
+//               rows, so the source name is never available on the hop itself.
+//               Established paths are suppressed on two keys: the exact path, and the
+//               account reaching the same target through any pivot. The second key is what
+//               survives session host rotation in an RDS or AVD collection.
 // Type        : Detection
+// Platform    : Microsoft Sentinel / Log Analytics (TimeGenerated)
 //
-// Tables      : DeviceLogonEvents, IdentityInfo
-// Connectors  : Microsoft Defender for Endpoint (DeviceLogonEvents),
+// Tables      : DeviceLogonEvents, DeviceNetworkInfo, IdentityInfo
+// Connectors  : Microsoft Defender XDR (DeviceLogonEvents, DeviceNetworkInfo),
 //               Microsoft Sentinel UEBA (IdentityInfo)
 // License     : Microsoft Defender for Endpoint P2 + Microsoft Sentinel;
 //               Microsoft Entra ID P2 recommended (UEBA / IdentityInfo enrichment)
+// Rule timing : queryFrequency PT1H, queryPeriod P14D
 //
-// Tuning      : - DetectionWindow - how recent the onward hop must be; one alert per onward hop
+// Coverage    : Around 40 percent of RemoteInteractive rows carry a source address. A hop
+//               without one cannot be linked to a pivot, so it is used as an inbound hop
+//               only and never as an onward hop.
+//
+// Tuning      : - DetectionWindow - how recent the onward hop must be. Do not widen this to
+//                 size volume: BaselineWindow must stay larger or the baseline range inverts,
+//                 returns nothing, and every threshold below silently stops working. The
+//                 max_of guard prevents the inversion but a wide window still leaves no
+//                 usable history, and the IP map is only sound across the detection window.
 //               - HopWindow - max gap allowed between the inbound hop and the onward hop
-//               - BaselineWindow - history depth for suppressing established pivot paths
-//               - EstablishedHopThreshold - suppress B->C pivots this account has done >= N times in the baseline
-//               - ExcludedHostRegex - sanctioned jump hosts / bastions / AVD pools (default \b\B matches nothing; replace, do NOT set "")
-//               - ExcludedAccounts - service / monitoring accounts that pivot by design
-//               - SensitiveRoles - directory roles that set the PrivilegedAccount indicator
+//               - BaselineWindow - history depth for suppressing established paths
+//               - IpMapWindow - snapshot depth for resolving a source address to a device
+//               - EstablishedHopThreshold - suppress a path this account has walked >= N times
+//               - EstablishedTargetThreshold - suppress a target this account has reached by
+//                 nesting >= N times through any pivot. Raise this first in an RDS estate.
+//               - ExcludedHostRegex - sanctioned jump hosts, bastions and session host pools.
+//                 Match the pool prefix rather than each member, e.g. "(?i)^(AVD-|SAVD-|.*RDS)"
+//                 (default \b\B matches nothing; replace, do NOT set "")
+//               - ExcludedAccounts - service accounts, matched case insensitively on SAM name
 //
-// Known FPs   : - Admins hopping through a sanctioned jump host - exclude the host or raise EstablishedHopThreshold
-//               - Established daily pivot paths - cleared by the baseline suppression
-//               - Newly built or re-imaged pivot hosts - baseline clears within 14 days
+// Known FPs   : - RDS or AVD collections. The target key clears these once the baseline has
+//                 14 days of history. Add the pool prefix to ExcludedHostRegex if still noisy.
+//               - RD Gateway or NAT between hops presents the middlebox as the pivot
+//               - A pivot host that changes address resets its own path baseline, alerts once
+//               - B2B guest contractors raise the guest indicator by design
 //
 // Author      : Bartosz Wysocki | https://www.itprofessor.cloud
-// Version     : 1.0 | 2026-06-17
+// Version     : 3.0 | 2026-09-09
 // =====================================================================
-let DetectionWindow = 1h;            // the onward hop must land within this window
-let HopWindow = 60m;                 // max gap between the inbound hop and the onward hop
-let BaselineWindow = 14d;            // history for suppressing established pivot paths
-let IdentityLookback = 30d;
-let EstablishedHopThreshold = 5;     // B->C pivots this account has done >= N times in the baseline are treated as routine
-let ExcludedHostRegex = @"\b\B";     // never-matches default (excludes nothing); replace e.g. with "(?i)(AVD|RDS|JUMP|BASTION)"
-let ExcludedAccounts = dynamic([]);  // e.g. ["svc-monitoring", "breakglass"] matched on SAM name
+let DetectionWindow = 1h;                 // the onward hop must land within this window
+let HopWindow = 60m;                      // max gap between the inbound hop and the onward hop
+let BaselineWindow = 14d;                 // history for suppressing established paths
+let IdentityLookback = 14d;
+let IpMapWindow = 12h;                    // snapshot depth for resolving an address to a device
+let EstablishedHopThreshold = 5;          // exact path walked >= N times is routine
+let EstablishedTargetThreshold = 5;       // target reached by nesting >= N times is routine
+let ExcludedHostRegex = @"\b\B";          // never-matches default; e.g. "(?i)^(AVD-|SAVD-|.*RDS)"
+let ExcludedAccounts = dynamic([]);       // e.g. ["svc-monitoring", "breakglass"] on SAM name
+let RdpLogonTypes = dynamic(["RemoteInteractive", "CachedRemoteInteractive"]);
+let NullAddresses = dynamic(["0.0.0.0", "::", "127.0.0.1"]);
 let SensitiveRoles = dynamic([
 "Global Administrator",
 "Privileged Role Administrator",
@@ -46,89 +70,196 @@ let SensitiveRoles = dynamic([
 "User Administrator",
 "Intune Administrator",
 "Application Administrator",
-"Hybrid Identity Administrator",
-"Domain Admins",
-"Enterprise Admins"
+"Hybrid Identity Administrator"
 ]);
-// Normalize successful RDP logons; short host names so FQDN and NetBIOS forms join cleanly
-let RdpLogons = (windowStart:datetime, windowEnd:datetime) {
+let SensitiveGroups = dynamic([           // on-premises groups land in GroupMembership
+"Domain Admins",
+"Enterprise Admins",
+"Schema Admins",
+"Account Operators",
+"Server Operators",
+"Backup Operators"
+]);
+let BaselineEnd = ago(DetectionWindow);
+let BaselineStart = ago(max_of(BaselineWindow, DetectionWindow + 1d));
+let IpMapWindowEffective = max_of(IpMapWindow, DetectionWindow);
+let Hops = materialize(
     DeviceLogonEvents
-    | where Timestamp between (windowStart .. windowEnd)
+    | where TimeGenerated > ago(DetectionWindow + HopWindow)
     | where ActionType == "LogonSuccess"
-    | where LogonType == "RemoteInteractive"
+    | where LogonType in (RdpLogonTypes)
+    | where RemoteIPType != "Loopback"
     | extend
-        TargetHost = toupper(tostring(split(DeviceName, ".")[0])),        // host the logon landed on
-        SourceHost = toupper(tostring(split(RemoteDeviceName, ".")[0])),  // host the connection came from
-        Account = tolower(strcat(AccountDomain, "\\", AccountName)),
-        AccountName = tolower(AccountName)
-    | project Timestamp, DeviceId, DeviceName = toupper(DeviceName), TargetHost, SourceHost,
-              RemoteIP, RemoteIPType, Account, AccountName, AccountDomain, AccountSid, IsLocalAdmin
+        TargetHost = toupper(tostring(split(DeviceName, ".")[0])),    
+        Account = tolower(strcat(AccountDomain, "\\", AccountName))
+    | extend AccountName = tolower(AccountName)
     | extend AccountType = case(
         AccountName endswith "$" or AccountSid in ("S-1-5-18", "S-1-5-19", "S-1-5-20"), "Machine",
         isempty(AccountSid), "Unknown",
         "User")
-};
-// All RDP hops across the correlation window (onward hop window + the hop gap before it)
-let Hops = materialize(RdpLogons(ago(DetectionWindow + HopWindow), now()));
-// Onward hop B -> C: recent, with a known pivot host (B = SourceHost)
-let OnwardHops = Hops
-    | where Timestamp > ago(DetectionWindow)
-    | where isnotempty(SourceHost)
-    | project
-        OnwardTime = Timestamp, TargetC = DeviceName, TargetCHost = TargetHost, PivotHost = SourceHost,
-        OnwardRemoteIP = RemoteIP, OnwardRemoteIPType = RemoteIPType, OnwardIsLocalAdmin = IsLocalAdmin,
-        TargetCDeviceId = DeviceId, Account, AccountName, AccountDomain, AccountSid, AccountType;
-// Inbound hop ? -> B: any source (the origin may be external, which is itself interesting)
-let InboundHops = Hops
-    | project InboundTime = Timestamp, PivotTargetHost = TargetHost, OriginHost = SourceHost,
+    | project TimeGenerated, DeviceId, DeviceName = toupper(DeviceName), TargetHost,
+              RemoteIP, RemoteIPType, Account, AccountName, AccountDomain, AccountSid,
+              AccountType, IsLocalAdmin
+);
+let IpCandidates = toscalar(
+    Hops
+    | where isnotempty(RemoteIP) and RemoteIP !in (NullAddresses)
+    | summarize make_set(RemoteIP, 100000));
+let IpFromNetworkInfo =
+    DeviceNetworkInfo
+    | where TimeGenerated > ago(IpMapWindowEffective)
+    | where isnotempty(IPAddresses)
+    | mv-apply Adapter = parse_json(tostring(IPAddresses)) on (
+        project AdapterIP = tostring(Adapter.IPAddress)
+      )
+    | where isnotempty(AdapterIP)
+    | where set_has_element(IpCandidates, AdapterIP)
+    | summarize arg_max(TimeGenerated, DeviceName), Claimants = dcount(DeviceId) by AdapterIP
+    | project ResolvedIP = AdapterIP,
+              ResolvedHost = toupper(tostring(split(DeviceName, ".")[0])),
+              ResolvedSource = "NetworkInfo",
+              Claimants;
+let IpFromLogonWorkstation =
+    DeviceLogonEvents
+    | where TimeGenerated > ago(DetectionWindow + HopWindow)
+    | where ActionType == "LogonSuccess"
+    | where isnotempty(RemoteDeviceName)
+    | where set_has_element(IpCandidates, RemoteIP)
+    | summarize arg_max(TimeGenerated, RemoteDeviceName) by RemoteIP
+    | project ResolvedIP = RemoteIP,
+              ResolvedHost = toupper(tostring(split(RemoteDeviceName, ".")[0])),
+              ResolvedSource = "LogonWorkstation",
+              Claimants = tolong(1);
+let IpToHost = materialize(
+    union isfuzzy=true IpFromNetworkInfo, IpFromLogonWorkstation
+    | where isnotempty(ResolvedHost)
+    | extend SourceRank = iff(ResolvedSource == "NetworkInfo", 1, 2)
+    | summarize arg_min(SourceRank, ResolvedHost, ResolvedSource, Claimants) by ResolvedIP
+);
+// Onward hop B -> C: recent, with a pivot identified from the source address
+let OnwardHops =
+    Hops
+    | where TimeGenerated > ago(DetectionWindow)
+    | where isnotempty(RemoteIP) and RemoteIP !in (NullAddresses)
+    | lookup kind=leftouter (
+        IpToHost
+        | project ResolvedIP, PivotHost = ResolvedHost, PivotSource = ResolvedSource,
+                  PivotIpClaimants = Claimants
+      ) on $left.RemoteIP == $right.ResolvedIP
+    | where isnotempty(PivotHost)                        // no pivot identity, no chain to claim
+    | where PivotHost != TargetHost                      // ignore a host reached from itself
+    | project OnwardTime = TimeGenerated, TargetC = DeviceName, TargetCHost = TargetHost,
+              TargetCDeviceId = DeviceId, PivotHost, PivotIP = RemoteIP, PivotIPType = RemoteIPType,
+              PivotSource, PivotIpClaimants, OnwardIsLocalAdmin = IsLocalAdmin,
+              Account, AccountName, AccountDomain, AccountSid, AccountType;
+// Inbound hop ? -> B: any source, including external, unmanaged, or not recorded at all
+let InboundHops =
+    Hops
+    | project InboundTime = TimeGenerated, PivotTargetHost = TargetHost, PivotDeviceId = DeviceId,
               OriginIP = RemoteIP, OriginIPType = RemoteIPType, Account;
-// Established B -> C pivots for this account over the baseline (routine jump-host paths)
-let EstablishedPivots = RdpLogons(ago(BaselineWindow), ago(DetectionWindow))
-    | where isnotempty(SourceHost)
-    | summarize PivotHopCount = count() by Account, PivotHost = SourceHost, TargetCHost = TargetHost;
-// Identity context, keyed on the normalized SAM account name
-let IdentityContext = IdentityInfo
+// One baseline scan, two views of it. Keyed on the source address rather than the resolved
+// name, so a stale IP map can never suppress a real chain.
+let BaselinePaths = materialize(
+    DeviceLogonEvents
+    | where TimeGenerated between (BaselineStart .. BaselineEnd)
+    | where ActionType == "LogonSuccess"
+    | where LogonType in (RdpLogonTypes)
+    | where isnotempty(RemoteIP) and RemoteIP !in (NullAddresses)
+    | extend Account = tolower(strcat(AccountDomain, "\\", AccountName)),
+             TargetCHost = toupper(tostring(split(DeviceName, ".")[0]))
+    | summarize PivotHopCount = count() by Account, PivotIP = RemoteIP, TargetCHost
+);
+let EstablishedTargets = BaselinePaths | summarize TargetHopCount = sum(PivotHopCount) by Account, TargetCHost;
+// Identity context, keyed on the normalised SAM account name. column_ifexists guards every
+// optional column: IdentityInfo varies by UEBA version and a missing column fails the rule
+// at bind time rather than at runtime.
+let IdentityContext = materialize(
+    IdentityInfo
     | where TimeGenerated > ago(IdentityLookback)
-    | extend NormalizedAccountName = tolower(trim(" ", AccountName))
-    | summarize arg_max(TimeGenerated, AccountDisplayName, AccountUPN, IsAccountEnabled, UserType, AssignedRoles, GroupMembership, RiskLevel, RiskState) by NormalizedAccountName;
+    | extend NormalizedAccountName = tolower(trim(" ", tostring(column_ifexists("AccountName", ""))))
+    | where isnotempty(NormalizedAccountName)
+    | extend
+        IdDisplayName = tostring(column_ifexists("AccountDisplayName", "")),
+        IdUPN = tostring(column_ifexists("AccountUPN", "")),
+        IdEnabled = tobool(column_ifexists("IsAccountEnabled", true)),
+        IdUserType = tostring(column_ifexists("UserType", "")),
+        IdRoles = tostring(column_ifexists("AssignedRoles", "")),
+        IdGroups = tostring(column_ifexists("GroupMembership", "")),
+        IdRiskLevel = tostring(column_ifexists("RiskLevel", "")),
+        IdRiskState = tostring(column_ifexists("RiskState", ""))
+    | summarize arg_max(TimeGenerated, IdDisplayName, IdUPN, IdEnabled, IdUserType,
+                        IdRoles, IdGroups, IdRiskLevel, IdRiskState)
+        by NormalizedAccountName
+);
 OnwardHops
-| join kind=inner InboundHops on Account
-| where PivotTargetHost == PivotHost                 // the pivot (B) is the target of the inbound hop
-| where TargetCHost != PivotHost                     // the onward target (C) is a different host
+| join kind=inner InboundHops on Account, $left.PivotHost == $right.PivotTargetHost
 | where InboundTime < OnwardTime and OnwardTime <= InboundTime + HopWindow
 | summarize
     OnwardFirstSeen = min(OnwardTime),
     OnwardLastSeen = max(OnwardTime),
     ChainCount = count(),
-    arg_max(InboundTime, OriginHost, OriginIP, OriginIPType)
+    arg_max(InboundTime, OriginIP, OriginIPType, PivotDeviceId)
   by Account, AccountName, AccountDomain, AccountSid, AccountType,
-     PivotHost, TargetC, TargetCHost, OnwardRemoteIP, OnwardRemoteIPType, OnwardIsLocalAdmin, TargetCDeviceId
-| join kind=leftouter EstablishedPivots on Account, PivotHost, TargetCHost
-| extend PivotHopCount = coalesce(PivotHopCount, 0)
+     PivotHost, PivotIP, PivotIPType, PivotSource, PivotIpClaimants,
+     TargetC, TargetCHost, TargetCDeviceId, OnwardIsLocalAdmin
+// Both suppression keys have to clear
+| lookup kind=leftouter BaselinePaths on Account, PivotIP, TargetCHost
+| lookup kind=leftouter EstablishedTargets on Account, TargetCHost
+| extend PivotHopCount = coalesce(PivotHopCount, tolong(0)),
+         TargetHopCount = coalesce(TargetHopCount, tolong(0))
 | where PivotHopCount < EstablishedHopThreshold
+| where TargetHopCount < EstablishedTargetThreshold
 | where not(PivotHost matches regex ExcludedHostRegex) and not(TargetCHost matches regex ExcludedHostRegex)
 | where array_length(ExcludedAccounts) == 0 or AccountName !in~ (ExcludedAccounts)
-| join kind=leftouter IdentityContext on $left.AccountName == $right.NormalizedAccountName
-| extend Risk_1 = iff(PivotHopCount == 0, "NewNestedEdge", "")
-| extend Risk_2 = iff(OriginIPType =~ "Public", "ExternalOrigin", "")
-| extend Risk_3 = iff(OnwardIsLocalAdmin == true, "LocalAdminOnTarget", "")
-| extend Risk_4 = iff(tostring(AssignedRoles) has_any (SensitiveRoles), "PrivilegedAccount", "")
-| extend Risk_5 = iff(IsAccountEnabled == false or UserType =~ "Guest", "DisabledOrGuestAccount", "")
-| extend Risk_6 = iff(AccountType == "Machine", "MachineAccountRDP", "")
-| extend RiskIndicators = trim(@"\s\|\s*$", strcat(
-    iff(isnotempty(Risk_1), strcat(Risk_1, " | "), ""),
-    iff(isnotempty(Risk_2), strcat(Risk_2, " | "), ""),
-    iff(isnotempty(Risk_3), strcat(Risk_3, " | "), ""),
-    iff(isnotempty(Risk_4), strcat(Risk_4, " | "), ""),
-    iff(isnotempty(Risk_5), strcat(Risk_5, " | "), ""),
-    iff(isnotempty(Risk_6), strcat(Risk_6, " | "), "")
-))
+// Name the origin where possible. Enrichment, never a filter: an origin that cannot be named
+// is the more interesting case, not the one to drop. A logon with no address recorded at all
+// is normal for AVD and gateway reverse connect, so it is classified rather than scored.
+| lookup kind=leftouter (
+    IpToHost
+    | project ResolvedIP, OriginResolvedHost = ResolvedHost, OriginResolvedSource = ResolvedSource
+  ) on $left.OriginIP == $right.ResolvedIP
+| extend OriginSource = case(
+    isempty(OriginIP) or OriginIP in (NullAddresses) or OriginIPType =~ "Unspecified", "NoSourceRecorded",
+    isnotempty(OriginResolvedHost), OriginResolvedSource,
+    "Unresolved")
+| extend OriginHost = iff(OriginSource in ("NetworkInfo", "LogonWorkstation"), OriginResolvedHost, "")
+| extend PivotConfidence = case(
+    PivotSource == "NetworkInfo" and PivotIpClaimants == 1, "High",
+    PivotSource == "NetworkInfo", "Medium",
+    PivotSource == "LogonWorkstation", "Medium",
+    "Low")
+| extend ChainPath = strcat(
+    case(isnotempty(OriginHost), OriginHost,
+         OriginSource == "NoSourceRecorded", "(no source)",
+         OriginIP),
+    " > ", PivotHost, " > ", TargetCHost)
+| lookup kind=leftouter IdentityContext on $left.AccountName == $right.NormalizedAccountName
+| extend W_NewEdge      = iff(PivotHopCount == 0, 25, 0)
+| extend W_ExternalOrig = iff(OriginIPType =~ "Public", 25, 0)
+| extend W_LocalAdmin   = iff(OnwardIsLocalAdmin == true, 15, 0)
+| extend W_Privileged   = iff(IdRoles has_any (SensitiveRoles) or IdGroups has_any (SensitiveGroups), 20, 0)
+| extend W_AccountState = iff(IdEnabled == false or IdUserType =~ "Guest", 15, 0)
+| extend W_MachineAcct  = iff(AccountType == "Machine", 20, 0)
+| extend W_UnknownOrig  = iff(OriginSource == "Unresolved", 10, 0)
+| extend RiskScore = W_NewEdge + W_ExternalOrig + W_LocalAdmin + W_Privileged
+                   + W_AccountState + W_MachineAcct + W_UnknownOrig
+| extend RiskIndicators = strcat_array(set_difference(pack_array(
+    iff(W_NewEdge > 0, "NewNestedEdge", ""),
+    iff(W_ExternalOrig > 0, "ExternalOrigin", ""),
+    iff(W_LocalAdmin > 0, "LocalAdminOnTarget", ""),
+    iff(W_Privileged > 0, "PrivilegedAccount", ""),
+    iff(W_AccountState > 0, "DisabledOrGuestAccount", ""),
+    iff(W_MachineAcct > 0, "MachineAccountRDP", ""),
+    iff(W_UnknownOrig > 0, "UnresolvedOrigin", "")
+    ), dynamic([""])), " | ")
 | project
-    OnwardFirstSeen, OnwardLastSeen, RiskIndicators,
-    Account, AccountName, AccountDomain, AccountType, AccountSid, AccountUPN, AccountDisplayName,
-    OriginHost, OriginIP, OriginIPType, InboundTime,
-    PivotHost,
-    TargetC, TargetCHost, TargetCDeviceId, OnwardRemoteIP, OnwardRemoteIPType, OnwardIsLocalAdmin,
-    ChainCount, PivotHopCount,
-    IsAccountEnabled, UserType, AssignedRoles, GroupMembership, RiskLevel, RiskState
-| sort by OnwardLastSeen desc
+    OnwardFirstSeen, OnwardLastSeen, RiskScore, RiskIndicators, ChainPath,
+    Account, AccountName, AccountDomain, AccountType, AccountSid,
+    AccountUPN = IdUPN, AccountDisplayName = IdDisplayName,
+    OriginHost, OriginIP, OriginIPType, OriginSource, InboundTime,
+    PivotHost, PivotIP, PivotIPType, PivotSource, PivotConfidence, PivotDeviceId,
+    TargetC, TargetCHost, TargetCDeviceId, OnwardIsLocalAdmin,
+    ChainCount, PivotHopCount, TargetHopCount,
+    IsAccountEnabled = IdEnabled, UserType = IdUserType, AssignedRoles = IdRoles,
+    GroupMembership = IdGroups, RiskLevel = IdRiskLevel, RiskState = IdRiskState
+| sort by RiskScore desc, OnwardLastSeen desc
