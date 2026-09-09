@@ -56,8 +56,8 @@
           "aggregationKind": "SingleAlert"
         },
         "alertDetailsOverride": {
-          "alertDisplayNameFormat": "RDP Nesting: {{Account}} pivoted via {{PivotHost}} to {{TargetCHost}} (Risk {{RiskScore}})",
-          "alertDescriptionFormat": "Risk flags: {{RiskIndicators}} | Chain: {{ChainPath}} | Onward target: {{TargetC}}"
+          "alertDisplayNameFormat": "RDP Nesting: {{Account}} pivoted via {{PivotHost}} to {{TargetCHost}}",
+          "alertDescriptionFormat": "Risk: {{RiskScore}} ({{RiskIndicators}}) | Chain: {{ChainPath}}"
         },
         "customDetails": {
           "RiskScore": "RiskScore",
